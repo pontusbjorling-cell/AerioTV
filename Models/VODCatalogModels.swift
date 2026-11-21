@@ -61,6 +61,76 @@ struct VODCatalogQuery: Sendable, Hashable {
     var onlyHidden: Bool
     /// Raw value of `MoviesSortOrder`.
     var sortRaw: String
+    /// A real genre (`CinemaGenres` name), from the provider's genre text
+    /// or TMDB's. Independent of `genre`, which is a provider category.
+    var genreTag: String? = nil
+}
+
+// MARK: - Real genres (cinema home)
+
+/// One genre tile: its label and the genre names (provider or TMDB) that
+/// count as it. TMDB names movies "Science Fiction" and shows "Sci-Fi &
+/// Fantasy", providers copy either, so one tile matches all spellings.
+struct CinemaGenreDef: Sendable, Hashable {
+    let name: String
+    let tokens: [String]
+}
+
+enum CinemaGenres {
+    static func list(for kind: VODItemType) -> [CinemaGenreDef] {
+        kind == .series ? series : movies
+    }
+
+    static func def(named name: String, kind: VODItemType) -> CinemaGenreDef? {
+        list(for: kind).first { $0.name == name }
+    }
+
+    private static let movies: [CinemaGenreDef] = [
+        .init(name: "Action", tokens: ["Action", "Action & Adventure"]),
+        .init(name: "Comedy", tokens: ["Comedy"]),
+        .init(name: "Drama", tokens: ["Drama"]),
+        .init(name: "Thriller", tokens: ["Thriller"]),
+        .init(name: "Horror", tokens: ["Horror"]),
+        .init(name: "Sci-Fi", tokens: ["Science Fiction", "Sci-Fi", "Sci-Fi & Fantasy"]),
+        .init(name: "Adventure", tokens: ["Adventure", "Action & Adventure"]),
+        .init(name: "Animation", tokens: ["Animation"]),
+        .init(name: "Family", tokens: ["Family", "Kids"]),
+        .init(name: "Crime", tokens: ["Crime"]),
+        .init(name: "Romance", tokens: ["Romance"]),
+        .init(name: "Fantasy", tokens: ["Fantasy", "Sci-Fi & Fantasy"]),
+        .init(name: "Mystery", tokens: ["Mystery"]),
+        .init(name: "Documentary", tokens: ["Documentary"]),
+        .init(name: "War", tokens: ["War", "War & Politics"]),
+        .init(name: "History", tokens: ["History"]),
+        .init(name: "Western", tokens: ["Western"]),
+        .init(name: "Music", tokens: ["Music"]),
+    ]
+
+    private static let series: [CinemaGenreDef] = [
+        .init(name: "Drama", tokens: ["Drama"]),
+        .init(name: "Comedy", tokens: ["Comedy"]),
+        .init(name: "Crime", tokens: ["Crime"]),
+        .init(name: "Action & Adventure", tokens: ["Action & Adventure", "Action", "Adventure"]),
+        .init(name: "Sci-Fi & Fantasy", tokens: ["Sci-Fi & Fantasy", "Science Fiction", "Sci-Fi", "Fantasy"]),
+        .init(name: "Mystery", tokens: ["Mystery", "Thriller"]),
+        .init(name: "Animation", tokens: ["Animation"]),
+        .init(name: "Kids & Family", tokens: ["Kids", "Family"]),
+        .init(name: "Documentary", tokens: ["Documentary"]),
+        .init(name: "Reality", tokens: ["Reality"]),
+        .init(name: "War & Politics", tokens: ["War & Politics", "War"]),
+        .init(name: "Western", tokens: ["Western"]),
+        .init(name: "Soap", tokens: ["Soap"]),
+    ]
+
+    /// "Action & Adventure / Animation" or "Action, Drama" ->
+    /// "Action & Adventure|Animation". nil when there is nothing.
+    static func normalize(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let parts = raw.split(whereSeparator: { $0 == "/" || $0 == "," || $0 == "|" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: "|")
+    }
 }
 
 /// A tab's grid list backed by the catalog. Only the row ids and the rail

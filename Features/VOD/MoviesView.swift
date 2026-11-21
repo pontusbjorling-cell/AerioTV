@@ -222,6 +222,39 @@ struct MoviesView: View {
     /// 2026-09-04). Declared unguarded: the carousel binding is built in
     /// shared code.
     @State private var heroRestoreRequest = false
+    #if os(tvOS)
+    /// Art behind the whole page (cinema look): the focused title's.
+    @State private var ambientURL: URL?
+    /// The full list ("All Movies", a genre, or a category) is showing
+    /// instead of the home rows. Menu returns to the home rows.
+    @State private var browseAll = false
+    /// Real genre the full list is narrowed to (a genre tile).
+    @State private var browseGenreTag: String?
+    #endif
+
+    /// Home rows (genres, Continue Watching, Favorites, categories) or the
+    /// full list. iOS keeps its single page.
+    private var showCinemaHome: Bool {
+        #if os(tvOS)
+        return !browseAll
+        #else
+        return true
+        #endif
+    }
+    private var showLibraryGrid: Bool {
+        #if os(tvOS)
+        return browseAll
+        #else
+        return true
+        #endif
+    }
+    private var browseGenreTagValue: String? {
+        #if os(tvOS)
+        return browseGenreTag
+        #else
+        return nil
+        #endif
+    }
     /// tvOS grid: seven columns, 24 pt gutters (shelf width + rail math use it too).
     private let tvGridColumns = 7
     private let tvGridColumnSpacing: CGFloat = 24
@@ -577,7 +610,11 @@ struct MoviesView: View {
         let _ = TabProbe.body("MoviesView")
         NavigationStack(path: $navPath) {
             ZStack {
+                #if os(tvOS)
+                CinemaAmbientBackground(url: ambientURL, headers: dispatcharrHeaders)
+                #else
                 Color.appBackground.ignoresSafeArea()
+                #endif
 
                 if libraryCount == 0 && (isLoadingLibrary || (!hasLoadedLibrary && libraryError == nil)) {
                     // Before the first sweep of this session has run (the
@@ -616,7 +653,7 @@ struct MoviesView: View {
             // Also hidden while a detail is pushed: the detail's own
             // .toolbar(.hidden) did not win over this root assertion on
             // tvOS 27 (bar stayed on the movie page, Logan 2026-09-04).
-            .toolbar((tvTabBarHidden || !navPath.isEmpty) ? .hidden : .visible, for: .tabBar)
+            .toolbar((tvTabBarHidden || !navPath.isEmpty || browseAll) ? .hidden : .visible, for: .tabBar)
             #endif
             #if os(iOS)
             // Phone pass (Logan 2026-09-05): no navigation bar; the hero
@@ -638,7 +675,8 @@ struct MoviesView: View {
                 let onlyHidden = showingHiddenOnly
                 let list = await vodStore.library(kind: kind, hiddenGroups: hidden,
                                                   hiddenTitleKeys: hiddenIDs, genre: genre,
-                                                  onlyHidden: onlyHidden, sortRaw: sortOrderRaw)
+                                                  onlyHidden: onlyHidden, sortRaw: sortOrderRaw,
+                                                  genreTag: browseGenreTagValue)
                 guard !Task.isCancelled else { return }
                 let recent = await vodStore.recentlyAdded(kind: kind, hiddenGroups: hidden,
                                                           hiddenTitleKeys: hiddenIDs)
@@ -1118,13 +1156,15 @@ struct MoviesView: View {
         let sort: String
         let hiddenIDs: Set<String>
         let onlyHidden: Bool
+        var genreTag: String? = nil
     }
     private var libraryKey: LibraryKey {
         LibraryKey(revision: vodStore.catalogRevision,
                    count: libraryCount,
                    catalogKey: vodStore.catalogKey,
                    hidden: effectiveHiddenGroups, genre: selectedGenre, sort: sortOrderRaw,
-                   hiddenIDs: hiddenKeys, onlyHidden: showingHiddenOnly)
+                   hiddenIDs: hiddenKeys, onlyHidden: showingHiddenOnly,
+                   genreTag: browseGenreTagValue)
     }
 
     /// The library sort, also applied to search results (Logan 2026-09-04).
@@ -1536,9 +1576,8 @@ struct MoviesView: View {
                 } : nil,
                 railLetters: railLetters,
                 railTarget: { letter in firstGridID(for: letter) },
-                footer: TMDBPosters.isEnabled
-                    ? { AnyView(TMDBAttributionView(style: .long)) }
-                    : nil,
+                // TMDB attribution lives in Settings > Movies & TV Shows.
+                footer: nil,
                 owningTab: kind == .series ? .tvShows : .movies,
                 isAtRoot: isAtRoot
             )
@@ -1686,11 +1725,23 @@ struct MoviesView: View {
                                 Color.clear.frame(height: 3)
                             }
                             #endif
+                            #if os(tvOS)
+                            if showCinemaHome {
+                                CinemaGenreRow(
+                                    kind: kind,
+                                    hiddenGroups: effectiveHiddenGroups,
+                                    hiddenTitleKeys: hiddenKeys,
+                                    headers: dispatcharrHeaders,
+                                    onSelect: { openBrowse(genreTag: $0) },
+                                    onFocus: { url in if let url { ambientURL = url } }
+                                )
+                            }
+                            #endif
                             // Continue Watching IS the hero: one page per title
                             // in progress (Logan 2026-09-03), so the separate
                             // poster row is gone from this tab.
                             let pages = heroPages
-                            if !pages.isEmpty {
+                            if !pages.isEmpty && showCinemaHome {
                                 // Section header above the hero (Logan
                                 // 2026-09-11), styled and inset exactly like
                                 // the shelf titles below ("Watchlist"), with a
@@ -1698,6 +1749,76 @@ struct MoviesView: View {
                                 // for the Continue Watching hero: the library
                                 // fallback page (newest addition) carries no
                                 // progress and was never labeled.
+                                #if os(tvOS)
+                                CinemaContinueRow(
+                                    title: heroIsContinueWatching ? "Continue Watching" : "Recently Added",
+                                    pages: heroIsContinueWatching
+                                        ? pages
+                                        : (recentlyAdded.isEmpty ? pages
+                                           : recentlyAdded.prefix(12).map { MoviesHeroPage(item: $0, progress: nil) }),
+                                    headers: dispatcharrHeaders,
+                                    focusRequest: heroFocusRequestBinding,
+                                    restoreRequest: Binding(get: { heroRestoreRequest },
+                                                            set: { heroRestoreRequest = $0 }),
+                                    onHeroFocusChange: { focused in
+                                        #if os(tvOS)
+                                        heroHasFocus = focused
+                                        guard focused else { return }
+                                        tabBarOnScreen = TVFocusBridge.isTabBarOnScreen(preferredTitle: tab.title)
+                                        // Any hero button gaining focus while the
+                                        // page is scrolled brings the page back to
+                                        // the top, focus staying on that button
+                                        // (Logan 2026-09-04: Up from Search should
+                                        // scroll up AND land on the hero button).
+                                        if !tabBarOnScreen, !scrollToTopInFlight {
+                                            let y = geometryBox.contentOffsetY
+                                            scrollToTopInFlight = true
+                                            if y < deepJumpThreshold {
+                                                // Short hop (shelf -> hero): the reader
+                                                // scroll animates in step with the focus
+                                                // engine's own scroll; the position scroll
+                                                // snapped here (Logan 2026-09-04).
+                                                withAnimation(.easeInOut(duration: 0.35)) {
+                                                    proxy.scrollTo("movies-top", anchor: .top)
+                                                }
+                                            } else {
+                                                withAnimation(.smooth(duration: 0.45)) {
+                                                    scrollContent(toY: 0)
+                                                }
+                                            }
+                                            // Bar back at once: waiting for the
+                                            // scroll left a 0.6 s window where a
+                                            // quick second Up was swallowed by the
+                                            // top strip (trace 2026-09-04 15:12).
+                                            tvTabBarHidden = false
+                                            waitForTabBarOnScreen()
+                                        }
+                                        #endif
+                                    },
+                                    onFocusPage: { page in
+                                        ambientURL = CinemaArt.landscape(page.item, override: page.backdropOverride)
+                                    },
+                                    onPrimary: { heroPrimary($0) },
+                                    onPlayFromStart: { page in
+                                        if kind == .series, let p = page.progress {
+                                            resumeFromContinueWatching(p, startAt: 0)
+                                        } else {
+                                            playMovie(page.item, resumePositionMs: 0)
+                                        }
+                                    },
+                                    onDetails: { navPath.append($0.item) },
+                                    onRemove: { page in
+                                        guard let p = page.progress else { return }
+                                        WatchProgressManager.delete(vodID: p.vodID, serverID: p.serverID)
+                                    },
+                                    isOnWatchlist: { page in
+                                        watchlistEntries.contains { $0.vodID == page.item.id
+                                            && ($0.serverID == nil || $0.serverID == page.item.serverID.uuidString) }
+                                    },
+                                    onToggleWatchlist: { page in WatchlistManager.toggle(page.item) }
+                                )
+                                .focusSection()
+                                #else
                                 VStack(alignment: .leading, spacing: shelfTitleSpacing) {
                                 if heroIsContinueWatching {
                                     Text("Continue Watching")
@@ -1770,10 +1891,12 @@ struct MoviesView: View {
                                 .focusSection()
                                 #endif
                                 }
+                                #endif
                             }
 
+
                             let watchlist = watchlistItems
-                            if !watchlist.isEmpty {
+                            if !watchlist.isEmpty && showCinemaHome {
                                 #if os(iOS)
                                 if UIDevice.current.userInterfaceIdiom == .phone {
                                     // Phone: the Watchlist is a second card deck, same
@@ -1806,21 +1929,52 @@ struct MoviesView: View {
                                         })
                                 }
                                 #else
-                                posterShelf(title: "Watchlist", items: watchlist)
-                                    .padding(.leading, contentLeadingInset)
-                                    .background(GeometryReader { g in
-                                        Color.clear.onAppear { geometryBox.watchlistShelfHeight = g.size.height }
-                                            .onChange(of: g.size.height) { _, h in geometryBox.watchlistShelfHeight = h }
-                                    })
+                                CinemaPosterRow(
+                                    title: "Favorites",
+                                    items: watchlist,
+                                    headers: dispatcharrHeaders,
+                                    onOpen: { navPath.append($0) },
+                                    onFocus: { ambientURL = CinemaArt.landscape($0) },
+                                    isFavorite: { _ in true },
+                                    onToggleFavorite: { WatchlistManager.toggle($0) }
+                                )
+                                .background(GeometryReader { g in
+                                    Color.clear.onAppear { geometryBox.watchlistShelfHeight = g.size.height }
+                                        .onChange(of: g.size.height) { _, h in geometryBox.watchlistShelfHeight = h }
+                                })
                                 #endif
                             }
+                            #if os(tvOS)
+                            if showCinemaHome {
+                                // The provider's own categories, one row each,
+                                // then the way into the full list.
+                                CinemaCategoryRows(
+                                    kind: kind,
+                                    categories: genrePills.filter { $0 != MoviesView.hiddenPillLabel },
+                                    hiddenTitleKeys: hiddenKeys,
+                                    headers: dispatcharrHeaders,
+                                    onOpen: { navPath.append($0) },
+                                    onSeeAll: { openBrowse(category: $0) },
+                                    onFocus: { ambientURL = CinemaArt.landscape($0) },
+                                    isFavorite: { item in
+                                        watchlistEntries.contains { $0.vodID == item.id
+                                            && ($0.serverID == nil || $0.serverID == item.serverID.uuidString) }
+                                    },
+                                    onToggleFavorite: { WatchlistManager.toggle($0) },
+                                    allTitle: "All \(kindTitle)",
+                                    onAll: { openBrowse() },
+                                    hiddenGroups: effectiveHiddenGroups
+                                )
+                            }
+                            #endif
                             // No Recently Added shelf (Logan 2026-09-04): the Watchlist
                             // is the one shelf under the hero. recentlyAdded still
                             // feeds the hero's fallback page.
 
+                            if showLibraryGrid {
                             let gridCount = isSearching ? filteredMovies.count : libraryMovies.count
-                            libraryHeader(title: isSearching ? "Results" : "All \(kindTitle)",
-                                          count: gridCount, showPills: !isSearching,
+                            libraryHeader(title: isSearching ? "Results" : browseTitle,
+                                          count: gridCount, showPills: !isSearching && browseGenreTagValue == nil,
                                           onTitleTap: {
                                               // Phone (Logan 2026-09-05): the title scrolls the
                                               // library to the top of the page, rail and all.
@@ -1870,16 +2024,9 @@ struct MoviesView: View {
                                         key: GridTopKey.self,
                                         value: g.frame(in: .named("moviesScroll")).minY.rounded())
                                 })
-                            // TMDB asks for the logo and the required line
-                            // wherever their data or images are shown, so it
-                            // rides under the library grid as well as on the
-                            // detail page. Appended only: no focus or scroll
-                            // behavior changes.
-                            if TMDBPosters.isEnabled {
-                                TMDBAttributionView(style: .long)
-                                    .padding(.horizontal, 18)
-                                    .padding(.leading, contentLeadingInset)
-                                    .padding(.bottom, 24)
+                            // TMDB attribution lives in Settings > Movies &
+                            // TV Shows (and Open Source Licenses), not under
+                            // every page.
                             }
                         }
                     }
@@ -1958,6 +2105,11 @@ struct MoviesView: View {
                 // is nothing to scroll, the press is forwarded to the
                 // tab-level routing by notification.
                 .onExitCommand {
+                    // Full list showing: Menu goes back to the home rows.
+                    if browseAll, !showSearchField {
+                        closeBrowse()
+                        return
+                    }
                     // The open search field is this view's own overlay:
                     // close it (focus the circle FIRST; removing the field
                     // while it held focus parked focus on the hero, whose
@@ -1970,10 +2122,16 @@ struct MoviesView: View {
                         NotificationCenter.default.post(name: .aerioTabMenuPassthrough, object: nil)
                     }
                 }
+                .onReceive(NotificationCenter.default.publisher(for: .aerioCinemaCloseBrowse)) { note in
+                    guard (note.userInfo?["tab"] as? String) == tab.rawValue, browseAll else { return }
+                    closeBrowse()
+                }
                 .onReceive(NotificationCenter.default.publisher(for: .aerioTabScrollToTop)) { note in
                     // Tagged with the tab: both VOD tabs stay mounted.
                     guard (note.userInfo?["tab"] as? String) == tab.rawValue else { return }
-                    if showSearchField {
+                    if browseAll, !showSearchField {
+                        closeBrowse()
+                    } else if showSearchField {
                         clearSearch()
                     } else if tvTabBarHidden || !heroHasFocus {
                         // Focus the hero; its focus-gain handler scrolls the
@@ -2128,7 +2286,11 @@ struct MoviesView: View {
                 // left the screen and bounced it twice at the top (Logan
                 // 2026-09-09). tvOS keeps the focus-driven mount.
                 #if os(tvOS)
+                // Only on a full list that has loaded: over the home rows, or
+                // while the list is still empty, the rail took focus with
+                // nothing beside it to move to.
                 let railMounted = searchText.isEmpty && railTop != nil && railVisible
+                    && showLibraryGrid && !libraryMovies.isEmpty
                 #else
                 let railMounted = searchText.isEmpty && railTop != nil
                 #endif
@@ -2377,6 +2539,36 @@ struct MoviesView: View {
         #endif
     }
 
+    /// Full-list heading: the genre or category it is narrowed to.
+    private var browseTitle: String {
+        browseGenreTagValue ?? selectedGenre ?? "All \(kindTitle)"
+    }
+
+    #if os(tvOS)
+    /// Show the full list, optionally narrowed to a real genre or a
+    /// provider category.
+    private func openBrowse(genreTag: String? = nil, category: String? = nil) {
+        browseGenreTag = genreTag
+        selectedGenre = category
+        browseAll = true
+        TVCinemaBrowseState.shared.openTabs.insert(tab.rawValue)
+        scrollContent(toY: 0)
+    }
+
+    /// Back to the home rows (Menu on the full list).
+    private func closeBrowse() {
+        if showSearchField { clearSearch() }
+        gridFocus = nil
+        railVisible = false
+        browseAll = false
+        TVCinemaBrowseState.shared.openTabs.remove(tab.rawValue)
+        browseGenreTag = nil
+        selectedGenre = nil
+        scrollContent(toY: 0)
+        heroFocusRequest = true
+    }
+    #endif
+
     /// Letters that have at least one title in the library grid (cached).
     private var railLetters: Set<String> { derived.railLetters }
 
@@ -2458,6 +2650,8 @@ struct MoviesView: View {
                     showSearchField.toggle()
                     if !showSearchField { searchText = "" }
                 }
+                // Straight into typing: the field appears with its keyboard up.
+                if showSearchField { TVKeyboard.open(placeholderPrefix: "Search \(kindLower)") }
             }
             .focused($searchCircleFocused)
             if isSearching {
@@ -2818,10 +3012,15 @@ struct MoviesView: View {
     /// Horizontal poster rail (Recently Added).
     private func posterShelf(title: String, items: [VODDisplayItem]) -> some View {
         VStack(alignment: .leading, spacing: shelfTitleSpacing) {
+            #if os(tvOS)
+            CinemaSectionTitle(title: title)
+                .padding(.horizontal, 16)
+            #else
             Text(title)
                 .scaledFont(.headlineSmall)
                 .foregroundColor(.textPrimary)
                 .padding(.horizontal, 16)
+            #endif
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(alignment: .top, spacing: shelfCardSpacing) {
                     ForEach(items) { item in
@@ -2831,6 +3030,7 @@ struct MoviesView: View {
                         }
                         #if os(tvOS)
                         .buttonStyle(MoviesPosterFocusStyle())
+                        .onCinemaFocus { ambientURL = CinemaArt.landscape(item) }
                         #else
                         .buttonStyle(.plain)
                         #endif

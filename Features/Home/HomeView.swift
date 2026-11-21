@@ -104,12 +104,21 @@ final class VODStore: ObservableObject {
     /// hands back ids plus rail buckets, never rows: the caller holds about
     /// 9 bytes per title and the window cache does the rest.
     func library(kind: VODItemType, hiddenGroups: Set<String>, hiddenTitleKeys: Set<String>,
-                 genre: String?, onlyHidden: Bool, sortRaw: String) async -> VODWindowList {
+                 genre: String?, onlyHidden: Bool, sortRaw: String,
+                 genreTag: String? = nil) async -> VODWindowList {
         guard let key = catalogKey else { return .empty }
         return await catalog.buildLibrary(VODCatalogQuery(
             playlistKey: key, kind: kind, hiddenGroups: hiddenGroups,
             hiddenTitleKeys: hiddenTitleKeys, genre: genre,
-            onlyHidden: onlyHidden, sortRaw: sortRaw))
+            onlyHidden: onlyHidden, sortRaw: sortRaw, genreTag: genreTag))
+    }
+
+    /// Genre tiles: titles per real genre plus a few posters each.
+    func genreOverview(kind: VODItemType, hiddenGroups: Set<String>,
+                       hiddenTitleKeys: Set<String>) async -> [(name: String, count: Int, items: [VODDisplayItem])] {
+        guard let key = catalogKey else { return [] }
+        return await catalog.genreOverview(playlistKey: key, kind: kind, hiddenGroups: hiddenGroups,
+                                           hiddenTitleKeys: hiddenTitleKeys)
     }
 
     /// Per-keystroke library search, as a database query off the main actor.
@@ -147,6 +156,19 @@ final class VODStore: ObservableObject {
         guard let key = catalogKey else { return [] }
         return await catalog.recentlyAdded(playlistKey: key, kind: kind,
                                            hiddenGroups: hiddenGroups, hiddenTitleKeys: hiddenTitleKeys)
+    }
+
+    func itemsByCleanTitles(kind: VODItemType, cleanTitles: [String]) async -> [String: VODDisplayItem] {
+        guard let key = catalogKey else { return [:] }
+        return await catalog.itemsByCleanTitles(playlistKey: key, kind: kind, cleanTitles: cleanTitles)
+    }
+
+    /// A few titles from one category, for a genre tile's posters.
+    func sample(kind: VODItemType, category: String, hiddenTitleKeys: Set<String>,
+                limit: Int = 3) async -> [VODDisplayItem] {
+        guard let key = catalogKey else { return [] }
+        return await catalog.sample(playlistKey: key, kind: kind, category: category,
+                                    hiddenTitleKeys: hiddenTitleKeys, limit: limit)
     }
 
     private func count(_ kind: VODItemType) -> Int { kind == .series ? seriesCount : moviesCount }
@@ -9607,6 +9629,15 @@ struct MainTabView: View {
             }
             debugLog("\u{1F3AE} [HMP]   \u{2192} branch: in-place search up \u{2192} closing it")
             withAnimation(.easeOut(duration: 0.2)) { showSearch = false }
+            return
+        }
+        // Movies / TV Shows full list (category, genre, All): Menu goes
+        // back to that tab's home rows. A pushed detail pops first.
+        if !isVODDetailPushed, !(nowPlaying.isActive && !nowPlaying.isMinimized),
+           TVCinemaBrowseState.shared.openTabs.contains(selectedTab.rawValue) {
+            debugLog("\u{1F3AE} [HMP]   \u{2192} branch: full list open \u{2192} back to home rows")
+            NotificationCenter.default.post(name: .aerioCinemaCloseBrowse, object: nil,
+                                            userInfo: ["tab": selectedTab.rawValue])
             return
         }
         #endif

@@ -45,7 +45,28 @@ struct MoviesTVSettingsView: View {
     @State private var tmdbKeyDraft = ""
     @State private var tmdbTestState: TMDBKeyTestState = .idle
 
-    enum TMDBKeyTestState: Equatable { case idle, testing, valid, invalid, saved }
+    enum TMDBKeyTestState: Equatable {
+        case idle, testing, valid, invalid, saved
+        /// Test failed; the text says why (shown under the buttons).
+        case failed(String)
+    }
+
+    private static func testState(for check: APIKeyCheck, service: String) -> TMDBKeyTestState {
+        switch check {
+        case .valid: return .valid
+        case .empty: return .failed("The key field is empty. Paste the key, then press Test.")
+        case .rejected(let why): return .failed("\(service) refused the key: \(why)")
+        case .unreachable(let why): return .failed("Couldn't reach \(service): \(why)")
+        }
+    }
+
+    /// OMDb key draft (IMDb / Rotten Tomatoes / Metacritic ratings on the
+    /// detail page). Keychain-backed like the TMDB key.
+    @State private var omdbKeyDraft = ""
+    @State private var omdbTestState: TMDBKeyTestState = .idle
+    /// Saved detail-page info (TMDB / OMDb) on disk, for the Clear row.
+    @State private var savedInfoBytes = 0
+    @State private var savedInfoCleared = false
 
     /// VOD (Movies / TV Shows) poster-grid scale multiplier. Storage key
     /// retained as `"uiScale"`.
@@ -69,6 +90,12 @@ struct MoviesTVSettingsView: View {
         .toolbarBackground(Color.appBackground, for: .navigationBar)
         .onAppear {
             tmdbKeyDraft = TMDBPosters.loadAPIKey()
+            omdbKeyDraft = OMDbRatings.loadAPIKey()
+            savedInfoCleared = false
+            Task.detached(priority: .utility) {
+                let bytes = MetadataDiskCache.diskSize()
+                await MainActor.run { savedInfoBytes = bytes }
+            }
             // Logan 2026-09-18: the range is 85-125% on every platform now.
             // Anyone who saved 150% or 175% under the old range would get a
             // slider value outside its bounds, so fold it back on entry.
@@ -82,10 +109,12 @@ struct MoviesTVSettingsView: View {
     @MainActor
     private func testTMDBKey() async {
         let key = tmdbKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { tmdbTestState = .invalid; return }
+        guard !key.isEmpty else {
+            debugLog("🎬 TMDB key test: field empty")
+            tmdbTestState = Self.testState(for: .empty, service: "TMDB"); return
+        }
         tmdbTestState = .testing
-        let ok = await TMDBService.validateKey(key)
-        tmdbTestState = ok ? .valid : .invalid
+        tmdbTestState = Self.testState(for: await TMDBService.checkKey(key), service: "TMDB")
     }
 
     private func saveTMDBKey() {
@@ -94,9 +123,55 @@ struct MoviesTVSettingsView: View {
         tmdbTestState = .saved
     }
 
+    // MARK: - OMDb key actions
+
+    @MainActor
+    private func testOMDbKey() async {
+        let key = omdbKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            debugLog("🍅 OMDb key test: field empty")
+            omdbTestState = Self.testState(for: .empty, service: "OMDb"); return
+        }
+        omdbTestState = .testing
+        let check = await OMDbService.checkKey(key)
+        if case .rejected(let why) = check, why.lowercased().contains("invalid api key") {
+            omdbTestState = .failed("OMDb refused the key. New OMDb keys only work after you open the activation link in OMDb's email.")
+        } else {
+            omdbTestState = Self.testState(for: check, service: "OMDb")
+        }
+    }
+
+    private func saveOMDbKey() {
+        OMDbRatings.saveAPIKey(omdbKeyDraft)
+        omdbTestState = .saved
+    }
+
+    /// Clear Saved Info: detail pages fetch from TMDB and OMDb again.
+    /// Hand-fixed matches and grid posters are kept.
+    private func clearSavedInfo() {
+        MetadataDiskCache.removeAll()
+        TMDBService.clearCache()
+        OMDbService.clearCache()
+        savedInfoBytes = 0
+        savedInfoCleared = true
+    }
+
+    private var savedInfoSummary: String {
+        if savedInfoCleared { return "Cleared" }
+        let size = ByteCountFormatter.string(fromByteCount: Int64(savedInfoBytes), countStyle: .file)
+        return savedInfoBytes > 0 ? "\(size) saved" : "Nothing saved yet"
+    }
+
+    private static let savedInfoFootnote = "Details, cast, related titles, episode info and ratings are saved the first time you open a title, so they load instantly afterwards. Ratings update by themselves every 30 days; everything else stays until you refresh it. To fix one title, use ⋯ on its page: Refresh Info fetches it again, Fix Match picks the right title. Clearing here keeps titles you matched by hand."
+
+    private static let omdbFootnote = "Shows IMDb, Rotten Tomatoes and Metacritic scores on movie and TV show pages. Your key is saved to your Keychain and, with iCloud Keychain on, syncs to your other Apple devices. Get a free key at omdbapi.com. Leave it empty to hide these ratings."
+
+    private var tmdbStatusView: some View { keyStatusView(tmdbTestState) }
+    private var omdbStatusView: some View { keyStatusView(omdbTestState) }
+
     @ViewBuilder
-    private var tmdbStatusView: some View {
-        switch tmdbTestState {
+    private func keyStatusView(_ state: TMDBKeyTestState) -> some View {
+        switch state {
         case .idle, .testing:
             EmptyView()
         case .valid:
@@ -108,6 +183,11 @@ struct MoviesTVSettingsView: View {
         case .saved:
             Label("Saved", systemImage: "checkmark.circle.fill")
                 .scaledFont(.labelSmall).foregroundColor(.green)
+        case .failed(let why):
+            Label(why, systemImage: "xmark.circle.fill")
+                .scaledFont(.labelSmall).foregroundColor(.red)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -191,6 +271,67 @@ struct MoviesTVSettingsView: View {
                         .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
                     TMDBAttributionView(style: .short)
                 }
+            }
+            .listSectionSeparator(.hidden)
+
+            // MARK: Ratings (OMDb)
+            Section {
+                SettingsTextField("OMDb API Key",
+                                  placeholder: "API Key",
+                                  text: $omdbKeyDraft,
+                                  isSecure: true)
+                    .onChange(of: omdbKeyDraft) { _, _ in omdbTestState = .idle }
+                    .listRowBackground(Color.cardBackground)
+
+                HStack(spacing: 12) {
+                    Button {
+                        Task { await testOMDbKey() }
+                    } label: {
+                        HStack(spacing: 6) {
+                            if omdbTestState == .testing {
+                                ProgressView().controlSize(.small)
+                            }
+                            Text("Test")
+                        }
+                    }
+                    .buttonStyle(SettingsGhostButtonStyle(accent: theme.accent))
+                    .disabled(omdbKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty
+                              || omdbTestState == .testing)
+
+                    omdbStatusView
+
+                    Spacer()
+
+                    Button("Save") { saveOMDbKey() }
+                        .buttonStyle(SettingsPrimaryButtonStyle(accent: theme.accent))
+                        .disabled(omdbTestState == .testing)
+                }
+                .listRowBackground(Color.cardBackground)
+            } header: {
+                Text("Ratings").sectionHeaderStyle()
+            } footer: {
+                Text(Self.omdbFootnote)
+                    .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
+            }
+            .listSectionSeparator(.hidden)
+
+            // MARK: Saved Info
+            Section {
+                HStack {
+                    Button("Clear Saved Info") { clearSavedInfo() }
+                        .buttonStyle(SettingsGhostButtonStyle(accent: theme.accent))
+                        .disabled(savedInfoCleared)
+                    Spacer()
+                    Text(savedInfoSummary)
+                        .scaledFont(.labelSmall.subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                }
+                .listRowBackground(Color.cardBackground)
+            } header: {
+                Text("Saved Info").sectionHeaderStyle()
+            } footer: {
+                Text(Self.savedInfoFootnote)
+                    .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
             }
             .listSectionSeparator(.hidden)
 
@@ -320,6 +461,64 @@ struct MoviesTVSettingsView: View {
                 TMDBAttributionView(style: .long)
                     .padding(.horizontal, 20)
                     .padding(.top, 12)
+            }
+
+            SettingsSection("Ratings", style: .plain) {
+                SettingsTextField("OMDb API Key",
+                                  placeholder: "API Key",
+                                  text: $omdbKeyDraft,
+                                  isSecure: true)
+                    .onChange(of: omdbKeyDraft) { _, _ in omdbTestState = .idle }
+                    .padding(.horizontal, 20)
+
+                HStack(spacing: 24) {
+                    TVCompactButton(
+                        title: omdbTestState == .testing ? "Testing…" : "Test",
+                        role: .ghost,
+                        disabled: omdbTestState == .testing
+                    ) { Task { await testOMDbKey() } }
+
+                    TVCompactButton(
+                        title: "Save",
+                        role: .primary,
+                        disabled: omdbTestState == .testing
+                    ) { saveOMDbKey() }
+
+                    omdbStatusView
+                    Spacer()
+                }
+                .padding(.horizontal, 20)
+                // Own focus section, like the scale row below: Down from
+                // the TMDB buttons must land here, not skip the row.
+                .focusSection()
+
+                Text(Self.omdbFootnote)
+                    .scaledFont(.system(size: 22).subtext())
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                    .padding(.horizontal, 20)
+                    .padding(.top, 4)
+            }
+
+            SettingsSection("Saved Info", style: .plain) {
+                HStack(spacing: 24) {
+                    TVCompactButton(
+                        title: "Clear Saved Info",
+                        role: .ghost,
+                        disabled: savedInfoCleared
+                    ) { clearSavedInfo() }
+                    Text(savedInfoSummary)
+                        .scaledFont(.system(size: 22).subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                    Spacer()
+                }
+                .padding(.horizontal, 20)
+                .focusSection()
+
+                Text(Self.savedInfoFootnote)
+                    .scaledFont(.system(size: 22).subtext())
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                    .padding(.horizontal, 20)
+                    .padding(.top, 4)
             }
 
             // Display Scale (Android parity, Logan 2026-09-27): the TV

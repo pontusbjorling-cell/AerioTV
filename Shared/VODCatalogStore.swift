@@ -141,6 +141,45 @@ final class VODCatalogStore: @unchecked Sendable {
             PRIMARY KEY (playlistKey, kind, name)
         );
         """)
+        // Real genres (cinema home). Provider genre text lives on the row;
+        // TMDB's genres, which the poster cache learns per title, live in
+        // their own table keyed by clean title so a sweep rewriting the
+        // rows does not drop them.
+        exec("""
+        CREATE TABLE IF NOT EXISTS vod_tmdb_genre (
+            kind TEXT NOT NULL,
+            cleanTitle TEXT NOT NULL,
+            genres TEXT NOT NULL,
+            PRIMARY KEY (kind, cleanTitle)
+        );
+        """)
+        var hasGenres = false
+        query("PRAGMA table_info(vod_title);") { stmt in
+            if self.text(stmt, 1) == "genres" { hasGenres = true }
+        }
+        if !hasGenres {
+            exec("ALTER TABLE vod_title ADD COLUMN genres TEXT;")
+            backfillProviderGenres()
+        }
+    }
+
+    /// One-time fill of the new `genres` column from the stored rows'
+    /// provider genre text (rows written before the column existed).
+    private func backfillProviderGenres() {
+        var updates: [(Int64, String)] = []
+        query("""
+        SELECT id, COALESCE(json_extract(CAST(payload AS TEXT), '$.series.genre'),
+                            json_extract(CAST(payload AS TEXT), '$.movie.genre'), '')
+        FROM vod_title
+        """) { stmt in
+            let raw = self.text(stmt, 1)
+            if let g = CinemaGenres.normalize(raw) { updates.append((sqlite3_column_int64(stmt, 0), g)) }
+        }
+        guard !updates.isEmpty else { return }
+        run("BEGIN IMMEDIATE;")
+        for (id, g) in updates { run("UPDATE vod_title SET genres = ? WHERE id = ?", [.text(g), .int(id)]) }
+        run("COMMIT;")
+        debugLog("[VOD-CAT] genres backfilled for \(updates.count) titles")
     }
 
     // MARK: - Tiny SQLite helpers
@@ -273,6 +312,7 @@ final class VODCatalogStore: @unchecked Sendable {
             .text(searchText),
             .blob(payload),
             .int(generation),
+            CinemaGenres.normalize(item.genreText).map { Bound.text($0) } ?? .null,
         ]
     }
 
@@ -298,12 +338,12 @@ final class VODCatalogStore: @unchecked Sendable {
         return await offMain { [weak self] in
             guard let self, self.ensureOpen() != nil else { return 0 }
             let columns = "playlistKey, kind, itemKey, title, sortKey, bucket, year, ratingValue, "
-                + "addedAt, category, tmdbId, normTitle, cleanTitle, searchText, payload, generation"
-            let insertSQL = "INSERT OR IGNORE INTO vod_title (\(columns)) VALUES (\(Self.placeholders(16)))"
+                + "addedAt, category, tmdbId, normTitle, cleanTitle, searchText, payload, generation, genres"
+            let insertSQL = "INSERT OR IGNORE INTO vod_title (\(columns)) VALUES (\(Self.placeholders(17)))"
             let updateSQL = """
             UPDATE vod_title SET title = ?, sortKey = ?, bucket = ?, year = ?, ratingValue = ?,
                 addedAt = ?, category = ?, tmdbId = ?, normTitle = ?, cleanTitle = ?,
-                searchText = ?, payload = ?, generation = ?
+                searchText = ?, payload = ?, generation = ?, genres = ?
             WHERE playlistKey = ? AND kind = ? AND itemKey = ? AND generation <> ?
             """
             var touched = 0
@@ -613,6 +653,11 @@ final class VODCatalogStore: @unchecked Sendable {
             let k = self.kindCode(q.kind)
             var sql = "SELECT id, bucket FROM vod_title WHERE playlistKey = ? AND kind = ?"
             var args: [Bound] = [.text(q.playlistKey), .text(k)]
+            if let tag = q.genreTag, let def = CinemaGenres.def(named: tag, kind: q.kind) {
+                let (clause, binds) = Self.genreClause(def, kindCode: k)
+                sql += " AND " + clause
+                args += binds
+            }
             // Hidden titles. `HiddenVODStore` keys are "<type>:<id>"; the set
             // is a handful of rows in practice, so it binds directly.
             let prefix = (q.kind == .series ? "series" : "movie") + "|"
@@ -692,6 +737,91 @@ final class VODCatalogStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - Real genres
+
+    /// SQL matching rows whose provider genres or TMDB genres name `def`.
+    /// Uses `vod_title` unaliased; genre lists are stored "A|B|C".
+    private static func genreClause(_ def: CinemaGenreDef, kindCode: String) -> (String, [Bound]) {
+        let haystack = "('|' || COALESCE(vod_title.genres, '') || '|' || COALESCE((SELECT g.genres FROM vod_tmdb_genre g "
+            + "WHERE g.kind = ? AND g.cleanTitle = vod_title.cleanTitle), '') || '|')"
+        let ors = def.tokens.map { _ in "\(haystack) LIKE ?" }.joined(separator: " OR ")
+        var binds: [Bound] = []
+        for t in def.tokens { binds.append(.text(kindCode)); binds.append(.text("%|\(t)|%")) }
+        return ("(" + ors + ")", binds)
+    }
+
+    /// TMDB genres the poster cache learned, keyed by clean title.
+    func setTMDBGenres(_ rows: [(kind: VODItemType, cleanTitle: String, genres: String)]) async {
+        guard !rows.isEmpty else { return }
+        await offMain { [weak self] in
+            guard let self, self.ensureOpen() != nil else { return }
+            self.run("BEGIN IMMEDIATE;")
+            for r in rows {
+                self.run("INSERT OR REPLACE INTO vod_tmdb_genre (kind, cleanTitle, genres) VALUES (?, ?, ?)",
+                         [.text(self.kindCode(r.kind)), .text(r.cleanTitle), .text(r.genres)])
+            }
+            self.run("COMMIT;")
+        }
+    }
+
+    /// Genre tiles: how many visible titles each genre has, plus up to
+    /// three posters. Genres with no titles are left out.
+    func genreOverview(playlistKey: String, kind: VODItemType, hiddenGroups: Set<String>,
+                       hiddenTitleKeys: Set<String>) async -> [(name: String, count: Int, items: [VODDisplayItem])] {
+        await offMain { [weak self] in
+            guard let self, self.ensureOpen() != nil else { return [] }
+            let k = self.kindCode(kind)
+            var base = "FROM vod_title WHERE playlistKey = ? AND kind = ?"
+            var baseArgs: [Bound] = [.text(playlistKey), .text(k)]
+            if !hiddenGroups.isEmpty {
+                let groups = Array(hiddenGroups.prefix(Self.maxBind))
+                base += " AND (category IS NULL OR category NOT IN (\(Self.placeholders(groups.count))))"
+                baseArgs += groups.map { Bound.text($0) }
+            }
+            let prefix = (kind == .series ? "series" : "movie") + "|"
+            let hidden = Set(hiddenTitleKeys.filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) })
+            var out: [(name: String, count: Int, items: [VODDisplayItem])] = []
+            for def in CinemaGenres.list(for: kind) {
+                let (clause, binds) = Self.genreClause(def, kindCode: k)
+                var count = 0
+                self.query("SELECT COUNT(*) " + base + " AND " + clause, baseArgs + binds) { stmt in
+                    count = Int(sqlite3_column_int64(stmt, 0))
+                }
+                guard count > 0 else { continue }
+                var items: [VODDisplayItem] = []
+                self.query("SELECT payload " + base + " AND " + clause
+                           + " ORDER BY (addedAt IS NULL) ASC, addedAt DESC, sortKey ASC LIMIT 24",
+                           baseArgs + binds) { stmt in
+                    if let item = self.decodeRow(stmt, 0), !hidden.contains(item.id) { items.append(item) }
+                }
+                let withArt = items.filter { $0.posterURL != nil }
+                out.append((def.name, count, Array((withArt + items.filter { $0.posterURL == nil }).prefix(3))))
+            }
+            return out
+        }
+    }
+
+    /// A few titles from one category, newest first, those with art
+    /// before those without: the posters fanned out on a genre tile.
+    func sample(playlistKey: String, kind: VODItemType, category: String,
+                hiddenTitleKeys: Set<String>, limit: Int = 3) async -> [VODDisplayItem] {
+        await offMain { [weak self] in
+            guard let self, self.ensureOpen() != nil else { return [] }
+            let sql = "SELECT payload FROM vod_title WHERE playlistKey = ? AND kind = ? AND category = ? "
+                + "ORDER BY (addedAt IS NULL) ASC, addedAt DESC, sortKey ASC LIMIT ?"
+            var out: [VODDisplayItem] = []
+            self.query(sql, [.text(playlistKey), .text(self.kindCode(kind)), .text(category),
+                             .int(Int64(limit * 8))]) { stmt in
+                if let item = self.decodeRow(stmt, 0) { out.append(item) }
+            }
+            let prefix = (kind == .series ? "series" : "movie") + "|"
+            let hidden = Set(hiddenTitleKeys.filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) })
+            let visible = out.filter { !hidden.contains($0.id) }
+            let withArt = visible.filter { $0.posterURL != nil }
+            return Array((withArt + visible.filter { $0.posterURL == nil }).prefix(limit))
+        }
+    }
+
     /// Group names present in the stored catalog, for sources that do not
     /// publish a category list of their own.
     func distinctCategories(playlistKey: String, kind: VODItemType) async -> [String] {
@@ -761,6 +891,26 @@ final class VODCatalogStore: @unchecked Sendable {
                 var sql = "SELECT normTitle, payload FROM vod_title WHERE playlistKey = ? AND kind = ?"
                 if requireNoTMDBID { sql += " AND (tmdbId IS NULL OR tmdbId = '')" }
                 sql += " AND normTitle IN (\(Self.placeholders(slice.count)))"
+                self.query(sql, [.text(playlistKey), .text(self.kindCode(kind))] + slice.map { Bound.text($0) }) { stmt in
+                    guard let key = self.text(stmt, 0), let item = self.decodeRow(stmt, 1) else { return }
+                    if out[key] == nil { out[key] = item }
+                }
+            }
+            return out
+        }
+    }
+
+    /// Titles by clean title (the `cleanTitle` column), many at once.
+    func itemsByCleanTitles(playlistKey: String, kind: VODItemType,
+                            cleanTitles: [String]) async -> [String: VODDisplayItem] {
+        guard !cleanTitles.isEmpty else { return [:] }
+        return await offMain { [weak self] in
+            guard let self, self.ensureOpen() != nil else { return [:] }
+            var out: [String: VODDisplayItem] = [:]
+            for chunk in stride(from: 0, to: cleanTitles.count, by: Self.maxBind) {
+                let slice = Array(cleanTitles[chunk..<min(chunk + Self.maxBind, cleanTitles.count)])
+                let sql = "SELECT cleanTitle, payload FROM vod_title WHERE playlistKey = ? AND kind = ?"
+                    + " AND cleanTitle IN (\(Self.placeholders(slice.count)))"
                 self.query(sql, [.text(playlistKey), .text(self.kindCode(kind))] + slice.map { Bound.text($0) }) { stmt in
                     guard let key = self.text(stmt, 0), let item = self.decodeRow(stmt, 1) else { return }
                     if out[key] == nil { out[key] = item }

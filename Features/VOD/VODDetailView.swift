@@ -269,6 +269,19 @@ struct VODDetailView: View {
     /// plot/genre/cast/director blank. Server values always win; TMDB
     /// only fills the holes, so fully-described libraries never hit TMDB.
     @State private var tmdbDetails: TMDBDetails?
+    /// IMDb / Rotten Tomatoes / Metacritic scores from OMDb. Nil until
+    /// loaded, or when no OMDb key is saved.
+    @State private var omdbScores: OMDbScores?
+    /// Bumped after Favorites / Watched change so the buttons re-read.
+    @State private var libraryStateTick = 0
+    /// The TMDB title the user picked with Fix Match, if any. Wins over
+    /// the provider's id and every title search.
+    @State private var matchOverride: MetadataMatchOverrides.Match?
+    #if os(tvOS)
+    @State private var showInfoOptions = false
+    @State private var showFixMatch = false
+    @State private var isRefreshingInfo = false
+    #endif
     /// Structured credits driving the Cast & Crew photo strip. NOT gated
     /// on missing metadata: servers only ever send comma-separated name
     /// strings, so headshots always need TMDB. Nil when the opt-in or
@@ -338,7 +351,16 @@ struct VODDetailView: View {
 
     var body: some View {
         ZStack {
+            #if os(tvOS)
+            if usesTVMovieLayout {
+                // Cinema look: the title's art, blurred, behind the whole page.
+                CinemaAmbientBackground(url: tvHeroURL, headers: serverHeaders())
+            } else {
+                Color.appBackground.ignoresSafeArea()
+            }
+            #else
             Color.appBackground.ignoresSafeArea()
+            #endif
             ScrollView {
                 // v1.6.12: explicit `.frame(maxWidth: .infinity, alignment: .leading)`
                 // on this outer VStack clamps the column to the
@@ -354,6 +376,7 @@ struct VODDetailView: View {
                         #if os(tvOS)
                         tvMovieHero
                         if item.type == .series { tvSeasonsSection }
+                        tvRatingsSection
                         #endif
                     } else {
                         heroSection
@@ -379,11 +402,7 @@ struct VODDetailView: View {
                         tvRelatedRefresh
                     }
                     #endif
-                    if TMDBPosters.isEnabled {
-                        TMDBAttributionView(style: .long)
-                            .padding(.horizontal, usesTVMovieLayout ? 56 : 16)
-                            .padding(.top, 24)
-                    }
+                    // TMDB attribution lives in Settings > Movies & TV Shows.
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 #if os(tvOS)
@@ -470,11 +489,14 @@ struct VODDetailView: View {
             restoreRememberedVersion()
         }
         .task {
+            matchOverride = MetadataMatchOverrides.match(for: item)
             await loadDetail()
             await loadVersionProviders()
             // Provider-info has settled once loadDetail() returns (the
             // task is sequential), satisfying the backfill's settled gate.
             await loadTMDBDetailsIfNeeded()
+            // After TMDB details: they carry the IMDb id OMDb is keyed by.
+            await loadOMDbScoresIfNeeded()
             await loadTMDBCreditsIfNeeded()
             await loadTMDBPosterIfNeeded()
             #if os(tvOS)
@@ -484,11 +506,11 @@ struct VODDetailView: View {
         }
         #if os(tvOS)
         .fullScreenCover(item: $bioPerson) { person in
-            PersonBioSheet(person: person, resolve: resolveKnownFor)
+            PersonBioSheet(person: person, resolve: resolveKnownFor, open: openFromBio)
         }
         #else
         .sheet(item: $bioPerson) { person in
-            PersonBioSheet(person: person, resolve: resolveKnownFor)
+            PersonBioSheet(person: person, resolve: resolveKnownFor, open: openFromBio)
         }
         #endif
         .navigationDestination(item: $knownForPush) { pushed in
@@ -671,74 +693,194 @@ struct VODDetailView: View {
         trailerURL(from: fullMovie?.youtubeTrailer ?? fullSeries?.youtubeTrailer ?? "")
     }
     private var tvTMDBURL: URL? {
-        let rawID = fullMovie?.tmdbID ?? fullSeries?.tmdbID
-            ?? item.movie?.tmdbID ?? item.series?.tmdbID ?? ""
+        let rawID = effectiveTMDBID ?? ""
         return rawID.isEmpty ? nil : tmdbURL(from: rawID, type: item.type)
     }
 
     private var tvMovieHero: some View {
-        ZStack(alignment: .leading) {
-            GeometryReader { geo in
-                if let url = tvHeroURL {
-                    AuthPosterImage(url: url, headers: serverHeaders(), placeholder: .clear, maxPixel: 1920)
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .clipped()
-                } else {
-                    Color.clear
+        tvHeroCopy
+            .frame(height: 880)
+            .frame(maxWidth: .infinity)
+            // Full-bleed art behind the copy, past the safe-area margins.
+            .background(alignment: .top) {
+                ZStack {
+                    GeometryReader { geo in
+                        if let url = tvHeroURL {
+                            AuthPosterImage(url: url, headers: serverHeaders(), placeholder: .clear, maxPixel: 1920)
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: geo.size.width, height: geo.size.height)
+                                .clipped()
+                        }
+                    }
+                    // Legibility: dark on the left where the copy sits ...
+                    LinearGradient(stops: [
+                        .init(color: .black.opacity(0.8), location: 0),
+                        .init(color: .black.opacity(0.4), location: 0.45),
+                        .init(color: .clear, location: 0.8)
+                    ], startPoint: .leading, endPoint: .trailing)
                 }
+                // ... and the art melts into the blurred page background.
+                .mask(LinearGradient(stops: [
+                    .init(color: .black, location: 0),
+                    .init(color: .black, location: 0.6),
+                    .init(color: .clear, location: 1)
+                ], startPoint: .top, endPoint: .bottom))
+                .ignoresSafeArea()
             }
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            LinearGradient(
-                stops: [
-                    .init(color: Color.appBackground, location: 0),
-                    .init(color: Color.appBackground, location: 0.12),
-                    .init(color: Color.appBackground.opacity(0.92), location: 0.38),
-                    .init(color: Color.appBackground.opacity(0.35), location: 0.7),
-                    .init(color: Color.appBackground.opacity(0.05), location: 1)
-                ],
-                startPoint: .leading, endPoint: .trailing)
-            LinearGradient(
-                stops: [
-                    .init(color: Color.appBackground.opacity(0), location: 0.55),
-                    .init(color: Color.appBackground, location: 1)
-                ],
-                startPoint: .top, endPoint: .bottom)
-            tvHeroCopy
+            .sheet(item: $qrLink) { link in
+                TVQRLinkSheet(link: TVQRLink(title: link.title, url: link.url.absoluteString), subtitle: link.subtitle)
+            }
+    }
+
+    /// Title (TMDB logo when there is one), then the button column beside
+    /// the meta line and plot.
+    private var tvHeroCopy: some View {
+        VStack(alignment: .leading, spacing: 30) {
+            if let logo = tmdbDetails?.logoPath, let url = TMDBService.imageURL(path: logo, size: "w500") {
+                AuthPosterImage(url: url, placeholder: .clear, maxPixel: 1000)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 640, maxHeight: 210, alignment: .bottomLeading)
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                    .accessibilityLabel(item.displayName)
+            } else {
+                Text(item.displayName)
+                    .scaledFont(.system(size: 76, weight: .heavy))
+                    .foregroundColor(.white)
+                    .lineLimit(2)
+                    .shadow(color: .black.opacity(0.5), radius: 10, y: 3)
+                    .frame(maxWidth: 1100, alignment: .leading)
+            }
+            HStack(alignment: .top, spacing: 56) {
+                tvActionRow
+                    .frame(width: 620, alignment: .leading)
+                VStack(alignment: .leading, spacing: 14) {
+                    tvMetaLine
+                    let plot = mergedPlot
+                    if !plot.isEmpty {
+                        Text(plot)
+                            .scaledFont(.system(size: 26))
+                            .foregroundColor(.white.opacity(0.88))
+                            .lineLimit(5)
+                            .lineSpacing(4)
+                    }
+                }
+                .frame(maxWidth: 880, alignment: .leading)
+            }
         }
-        .frame(height: 620)
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, 16)
-        .padding(.top, 40)
-        .sheet(item: $qrLink) { link in
-            TVQRLinkSheet(link: TVQRLink(title: link.title, url: link.url.absoluteString), subtitle: link.subtitle)
+        .padding(.horizontal, 56)
+        .padding(.bottom, 30)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    }
+
+    /// The small secondary buttons under Play (From Beginning, Version,
+    /// Trailer, TMDB), in the cinema pill look.
+    private func tvSmallButton(_ title: String, systemImage: String,
+                               action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage).lineLimit(1)
+        }
+        .buttonStyle(CinemaPillButtonStyle(height: 60, fill: false, fontSize: 23))
+    }
+
+    /// Every episode of the show, in season then episode order.
+    private var allEpisodesInOrder: [VODEpisode] {
+        (fullSeries?.seasons ?? [])
+            .sorted { $0.seasonNumber < $1.seasonNumber }
+            .flatMap { $0.episodes.sorted { $0.episodeNumber < $1.episodeNumber } }
+    }
+
+    /// Whole show watched: every episode is marked finished.
+    private var tvShowWatched: Bool {
+        let eps = allEpisodesInOrder
+        let progress = progressByEpisodeID
+        return !eps.isEmpty && eps.allSatisfy { progress[$0.id]?.isFinished == true }
+    }
+
+    /// TV shows: mark every episode watched, or reset the whole show.
+    @ViewBuilder
+    private var tvShowWatchedButton: some View {
+        if !allEpisodesInOrder.isEmpty {
+            let watched = tvShowWatched
+            Button {
+                let progress = progressByEpisodeID
+                for ep in allEpisodesInOrder {
+                    if watched {
+                        if progress[ep.id] != nil { toggleWatched(ep, watched: false) }
+                    } else if progress[ep.id]?.isFinished != true {
+                        toggleWatched(ep, watched: true)
+                    }
+                }
+                libraryStateTick += 1
+            } label: {
+                Label(watched ? "Watched" : "Mark Show as Watched",
+                      systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle")
+            }
+            .buttonStyle(CinemaPillButtonStyle(height: 66))
         }
     }
 
-    private var tvHeroCopy: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(item.displayName)
-                .scaledFont(.displayLarge)
-                .foregroundColor(.textPrimary)
-                .lineLimit(2)
-            tvMetaLine
-            let plot = mergedPlot
-            if !plot.isEmpty {
-                Text(plot)
-                    .scaledFont(.bodySmall.subtext())
-                    .foregroundColor(Color.contrastText(.textPrimary.opacity(0.85)))
-                    .lineLimit(4)
-                    .frame(maxWidth: 760, alignment: .leading)
-            }
-            tvActionRow
+    /// Long press on an episode: everything before it, and it, watched.
+    /// Specials (season 0) only count when the episode itself is a special.
+    private func markUpTo(_ target: VODEpisode) {
+        let progress = progressByEpisodeID
+        for ep in allEpisodesInOrder {
+            let before = ep.seasonNumber < target.seasonNumber
+                || (ep.seasonNumber == target.seasonNumber && ep.episodeNumber <= target.episodeNumber)
+            guard before, ep.seasonNumber > 0 || target.seasonNumber == 0 else { continue }
+            if progress[ep.id]?.isFinished != true { toggleWatched(ep, watched: true) }
         }
-        .padding(40)
-        .frame(maxWidth: 960, alignment: .leading)
-        .frame(maxHeight: .infinity, alignment: .bottom)
+    }
+
+    /// Favorites (heart) for this title.
+    private var tvFavoriteButton: some View {
+        let _ = libraryStateTick
+        let on = WatchlistManager.contains(item)
+        return Button {
+            WatchlistManager.toggle(item)
+            libraryStateTick += 1
+        } label: {
+            Image(systemName: on ? "heart.fill" : "heart")
+        }
+        .buttonStyle(CinemaPillButtonStyle())
+        .accessibilityLabel(on ? "Remove from Favorites" : "Add to Favorites")
+    }
+
+    /// Movie watched state, toggled from the detail page.
+    private var tvMovieWatched: Bool {
+        let _ = libraryStateTick
+        return WatchProgressManager.snapshot(vodID: item.id, serverID: item.serverID.uuidString)?.isFinished == true
+    }
+
+    private var tvWatchedButton: some View {
+        let watched = tvMovieWatched
+        return Button {
+            let movie = fullMovie ?? item.movie
+            if watched {
+                WatchProgressManager.delete(vodID: item.id, serverID: item.serverID.uuidString)
+            } else {
+                WatchProgressManager.save(
+                    vodID: item.id, title: item.displayName, positionMs: 0, durationMs: 0,
+                    posterURL: item.posterURL?.absoluteString, vodType: "movie", isFinished: true,
+                    streamURL: movie?.streamURL?.absoluteString, serverID: item.serverID.uuidString)
+            }
+            libraryStateTick += 1
+        } label: {
+            Label(watched ? "Watched" : "Mark as Watched",
+                  systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle")
+        }
+        .buttonStyle(CinemaPillButtonStyle(height: 66))
     }
 
     private var tvMetaParts: [String] {
         var parts: [String] = []
+        // Age rating: TMDB's for this Apple TV's region ("15+", "PG-13"),
+        // OMDb's US rating only when TMDB has none.
+        if let cert = tmdbDetails?.certificationLabel {
+            parts.append(cert)
+        } else if let rated = omdbScores?.rated,
+                  !["not rated", "unrated", "approved", "passed", "n/a"].contains(rated.lowercased()) {
+            parts.append(rated)
+        }
         let year = mergedYear
         if !year.isEmpty { parts.append(year) }
         if !mergedRuntime.isEmpty { parts.append(mergedRuntime) }
@@ -763,11 +905,11 @@ struct VODDetailView: View {
                         Image(systemName: "star.fill").scaledFont(.system(size: 18))
                         Text(rating)
                     }
-                    .foregroundColor(.accentPrimary)
                 }
             }
-            .scaledFont(.system(size: 22, weight: .medium).subtext())
-            .foregroundColor(Color.contrastText(.textSecondary))
+            // Cinema look: white meta line (was theme-tinted).
+            .scaledFont(.system(size: 24, weight: .semibold))
+            .foregroundColor(.white.opacity(0.9))
         }
     }
 
@@ -805,25 +947,33 @@ struct VODDetailView: View {
     }
 
     private var tvSeriesActionRow: some View {
-        HStack(spacing: 12) {
-            let target = tvSeriesTarget
-            MoviesHeroButton(
-                title: isLoadingDetail ? "Loading…" : (target?.label ?? "Play"),
-                systemImage: "play.fill", isPrimary: true
-            ) {
-                guard let target else { return }
-                playEpisode(target.episode)
-            }
-            .focused($playFocused)
-            .prefersDefaultFocus(true, in: detailFocusNS)
-            if let target, target.resuming {
-                MoviesHeroButton(title: "Play from Beginning", systemImage: "arrow.counterclockwise", isPrimary: false) {
-                    playEpisode(target.episode, fromStart: true)
+        let target = tvSeriesTarget
+        return VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 18) {
+                Button {
+                    guard let target else { return }
+                    playEpisode(target.episode)
+                } label: {
+                    Label(isLoadingDetail ? "Loading…" : (target?.label ?? "Play"), systemImage: "play.fill")
+                        .lineLimit(1)
                 }
+                .buttonStyle(CinemaPillButtonStyle(isPrimary: true))
+                .focused($playFocused)
+                .prefersDefaultFocus(true, in: detailFocusNS)
+                tvFavoriteButton
+                    .frame(width: 180)
             }
-            tvVersionButton
-            tvTrailerButton
-            tvTMDBButton
+            tvShowWatchedButton
+            HStack(spacing: 12) {
+                if let target, target.resuming {
+                    tvSmallButton("From Beginning", systemImage: "arrow.counterclockwise") {
+                        playEpisode(target.episode, fromStart: true)
+                    }
+                }
+                tvVersionButton
+                tvTrailerButton
+                tvTMDBButton
+            }
         }
         .focusSection()
     }
@@ -895,10 +1045,10 @@ struct VODDetailView: View {
                         HStack(spacing: 12) {
                             ForEach(Array(series.seasons.enumerated()), id: \.offset) { idx, season in
                                 Button { selectedSeason = idx } label: {
-                                    Text("Season \(season.seasonNumber)")
-                                        .scaledFont(.system(size: 22, weight: .medium))
+                                    Text(season.seasonNumber == 0 ? "Specials" : "Season \(season.seasonNumber)")
                                 }
-                                .buttonStyle(MoviesPillStyle(isSelected: selectedSeason == idx))
+                                .buttonStyle(CinemaPillButtonStyle(isPrimary: selectedSeason == idx,
+                                                                   height: 58, fill: false, fontSize: 24))
                             }
                         }
                         .padding(.horizontal, 56)
@@ -906,9 +1056,7 @@ struct VODDetailView: View {
                     }
                     .focusSection()
                 } else {
-                    Text("Episodes")
-                        .scaledFont(.headlineSmall)
-                        .foregroundColor(.textPrimary)
+                    CinemaSectionTitle(title: "Episodes")
                         .padding(.horizontal, 56)
                 }
                 if selectedSeason < series.seasons.count {
@@ -926,12 +1074,26 @@ struct VODDetailView: View {
                                 }
                                 .focused($focusedEpisodeID, equals: ep.id)
                                 .contextMenu {
-                                    let watched = progressByEpisodeID[ep.id]?.isFinished == true
+                                    // Hold Select on an episode.
+                                    let progress = progressByEpisodeID[ep.id]
+                                    if progress?.isFinished != true {
+                                        Button {
+                                            toggleWatched(ep, watched: true)
+                                        } label: {
+                                            Label("Mark as Watched", systemImage: "checkmark.circle")
+                                        }
+                                    }
                                     Button {
-                                        toggleWatched(ep, watched: !watched)
+                                        markUpTo(ep)
                                     } label: {
-                                        Label(watched ? "Mark as Unwatched" : "Mark as Watched",
-                                              systemImage: watched ? "eye.slash" : "checkmark.circle")
+                                        Label("Mark Up to Here as Watched", systemImage: "checkmark.circle.badge.questionmark")
+                                    }
+                                    if progress != nil {
+                                        Button(role: .destructive) {
+                                            toggleWatched(ep, watched: false)
+                                        } label: {
+                                            Label("Reset Watched Status", systemImage: "arrow.uturn.backward.circle")
+                                        }
                                     }
                                 }
                             }
@@ -981,7 +1143,7 @@ struct VODDetailView: View {
     private var tvVersionButton: some View {
         if versionProviders.count > 1 {
             let currentLabel = selectedVersion.map { label(for: $0) } ?? "Auto"
-            MoviesHeroButton(title: "Version: \(currentLabel)", systemImage: "square.stack.3d.up", isPrimary: false) {
+            tvSmallButton("Version: \(currentLabel)", systemImage: "square.stack.3d.up") {
                 tvVersionPickerPresented = true
             }
             .confirmationDialog("Version", isPresented: $tvVersionPickerPresented, titleVisibility: .visible) {
@@ -1000,7 +1162,7 @@ struct VODDetailView: View {
     @ViewBuilder
     private var tvTrailerButton: some View {
         if let trailer = tvTrailerURL {
-            MoviesHeroButton(title: "Trailer", systemImage: "play.rectangle.fill", isPrimary: false) {
+            tvSmallButton("Trailer", systemImage: "play.rectangle.fill") {
                 qrLink = QRLink(id: "trailer", title: "Trailer",
                                 subtitle: "Scan with your phone to watch the trailer on YouTube.",
                                 icon: "play.rectangle.fill", url: trailer)
@@ -1008,10 +1170,59 @@ struct VODDetailView: View {
         }
     }
 
+    /// "⋯": Refresh Info, Fix Match, Reset Match for this title's saved
+    /// TMDB / OMDb data.
+    private var tvInfoOptionsButton: some View {
+        MoviesHeroButton(title: isRefreshingInfo ? "Updating…" : "",
+                         systemImage: "ellipsis", isPrimary: false) {
+            guard !isRefreshingInfo else { return }
+            showInfoOptions = true
+        }
+        .accessibilityLabel("More options")
+        .confirmationDialog(item.displayName, isPresented: $showInfoOptions, titleVisibility: .visible) {
+            Button("Refresh Info") {
+                Task {
+                    isRefreshingInfo = true
+                    await refreshSavedInfo()
+                    isRefreshingInfo = false
+                }
+            }
+            if TMDBPosters.isEnabled, TMDBPosters.apiKey != nil {
+                Button("Fix Match…") { showFixMatch = true }
+            }
+            if matchOverride != nil {
+                Button("Reset Match", role: .destructive) {
+                    Task {
+                        isRefreshingInfo = true
+                        await resetMatch()
+                        isRefreshingInfo = false
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(matchOverride != nil
+                 ? "You matched this title by hand. Refresh Info keeps your match."
+                 : "Refresh Info fetches the details and ratings again. Fix Match lets you pick the right title if the wrong one is shown.")
+        }
+        .fullScreenCover(isPresented: $showFixMatch) {
+            FixMatchView(initialQuery: item.tmdbSearchTitle,
+                         isMovie: item.type == .movie,
+                         currentTMDBID: effectiveTMDBID) { candidate in
+                showFixMatch = false
+                Task {
+                    isRefreshingInfo = true
+                    await applyMatch(candidate)
+                    isRefreshingInfo = false
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private var tvTMDBButton: some View {
         if let tmdb = tvTMDBURL {
-            MoviesHeroButton(title: "TMDB", systemImage: "info.circle.fill", isPrimary: false) {
+            tvSmallButton("TMDB", systemImage: "info.circle.fill") {
                 qrLink = QRLink(id: "tmdb", title: "View on TMDB",
                                 subtitle: "Scan with your phone to view this title on TMDB.",
                                 icon: "info.circle.fill", url: tmdb)
@@ -1020,30 +1231,37 @@ struct VODDetailView: View {
     }
 
     private var tvMovieActionRow: some View {
-        HStack(spacing: 12) {
-            let movie = fullMovie ?? item.movie
-            let url = movie.flatMap { versionedMovieURL($0) ?? $0.streamURL }
-            let resume = tvResumeMs
-            MoviesHeroButton(
-                title: isResolvingURL ? "Loading…" : (resume > 0 ? "Resume" : "Play"),
-                systemImage: "play.fill", isPrimary: true
-            ) {
-                debugLog("[VOD-Play] pressed url=\(url?.absoluteString ?? "NIL") resolving=\(isResolvingURL)")
-                guard let url, let movie, !isResolvingURL else { return }
-                Task { await resolveAndLaunch(url: url, title: VODDisplayItem.strippingTrailingYears(movie.name)) }
-            }
-            .focused($playFocused)
-            .prefersDefaultFocus(true, in: detailFocusNS)
-            if resume > 0 {
-                MoviesHeroButton(title: "Play from Beginning", systemImage: "arrow.counterclockwise", isPrimary: false) {
+        let movie = fullMovie ?? item.movie
+        let url = movie.flatMap { versionedMovieURL($0) ?? $0.streamURL }
+        let resume = tvResumeMs
+        return VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 18) {
+                Button {
+                    debugLog("[VOD-Play] pressed url=\(url?.absoluteString ?? "NIL") resolving=\(isResolvingURL)")
                     guard let url, let movie, !isResolvingURL else { return }
-                    Task { await resolveAndLaunch(url: url, title: VODDisplayItem.strippingTrailingYears(movie.name),
-                                                   fromStart: true) }
+                    Task { await resolveAndLaunch(url: url, title: VODDisplayItem.strippingTrailingYears(movie.name)) }
+                } label: {
+                    Label(isResolvingURL ? "Loading…" : (resume > 0 ? "Resume" : "Play"), systemImage: "play.fill")
                 }
+                .buttonStyle(CinemaPillButtonStyle(isPrimary: true))
+                .focused($playFocused)
+                .prefersDefaultFocus(true, in: detailFocusNS)
+                tvFavoriteButton
+                    .frame(width: 180)
             }
-            tvVersionButton
-            tvTrailerButton
-            tvTMDBButton
+            tvWatchedButton
+            HStack(spacing: 12) {
+                if resume > 0 {
+                    tvSmallButton("From Beginning", systemImage: "arrow.counterclockwise") {
+                        guard let url, let movie, !isResolvingURL else { return }
+                        Task { await resolveAndLaunch(url: url, title: VODDisplayItem.strippingTrailingYears(movie.name),
+                                                       fromStart: true) }
+                    }
+                }
+                tvVersionButton
+                tvTrailerButton
+                tvTMDBButton
+            }
         }
         .focusSection()
     }
@@ -1059,8 +1277,7 @@ struct VODDetailView: View {
         guard relatedCandidates.isEmpty,
               TMDBPosters.isEnabled, let apiKey = TMDBPosters.apiKey else { return }
         let isMovie = item.type == .movie
-        let stored = [fullMovie?.tmdbID, fullSeries?.tmdbID, item.movie?.tmdbID, item.series?.tmdbID]
-            .compactMap { $0 }.first { !$0.isEmpty }
+        let stored = effectiveTMDBID
         let tmdbID: String?
         if let stored { tmdbID = stored } else {
             tmdbID = await TMDBService.resolveID(forTitle: item.displayName, isMovie: isMovie, apiKey: apiKey)
@@ -1089,7 +1306,7 @@ struct VODDetailView: View {
         guard stamp != relatedMatchedCount else { return }
         relatedMatchedCount = stamp
         let selfID = item.id
-        let byTMDB = await VODStore.shared.itemsByTMDBID(kind: kind, tmdbIDs: recs.map(\.id))
+        let byTMDB = await VODStore.shared.libraryMatches(recs)
         let byTitle = await VODStore.shared.itemsByNormalizedTitle(
             kind: kind, titles: recs.map { VODCatalogStore.normalized($0.title) }, requireNoTMDBID: true)
         let searchMatcher = LibraryMatcher(searchRows)
@@ -1112,36 +1329,16 @@ struct VODDetailView: View {
     @ViewBuilder
     private var tvRelatedSection: some View {
         if !relatedItems.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Available Related Titles")
-                    .scaledFont(.headlineSmall)
-                    .foregroundColor(.textPrimary)
-                    .padding(.horizontal, 56)
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: 32) {
-                        ForEach(relatedItems) { related in
-                            Button { pushDetail(related) } label: {
-                                VODPosterCard(item: related, headers: serverHeaders())
-                                    .frame(width: 200)
-                            }
-                            .buttonStyle(MoviesPosterFocusStyle())
-                            .contextMenu {
-                                Button {
-                                    WatchlistManager.toggle(related)
-                                } label: {
-                                    Label(WatchlistManager.contains(related) ? "Remove from Watchlist" : "Add to Watchlist",
-                                          systemImage: WatchlistManager.contains(related) ? "bookmark.slash" : "bookmark")
-                                }
-                                HiddenVODStore.menuButton(related)
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 56)
-                    .padding(.vertical, 36)
-                }
-            }
+            CinemaPosterRow(
+                title: "More Like This",
+                items: relatedItems,
+                headers: serverHeaders(),
+                onOpen: { pushDetail($0) },
+                isFavorite: { WatchlistManager.contains($0) },
+                onToggleFavorite: { WatchlistManager.toggle($0) }
+            )
+            .padding(.leading, -4)
             .padding(.top, 16)
-            .focusSection()
         }
     }
 
@@ -1219,14 +1416,98 @@ struct VODDetailView: View {
         return facts
     }
 
+    /// One score in the Ratings row.
+    private struct RatingTile: Identifiable {
+        let id: String
+        let badge: String
+        let badgeText: Color
+        let badgeFill: Color
+        let value: String
+        let caption: String
+    }
+
+    private var ratingTiles: [RatingTile] {
+        var tiles: [RatingTile] = []
+        if let s = omdbScores {
+            if let r = s.imdbRating {
+                tiles.append(RatingTile(id: "imdb", badge: "IMDb", badgeText: .black,
+                                        badgeFill: Color(hex: "F5C518"), value: r,
+                                        caption: s.imdbVotes.map { "\(Self.compactVotes($0)) votes" } ?? "IMDb"))
+            }
+            if let rt = s.rottenTomatoes {
+                let pct = Int(rt.filter(\.isNumber)) ?? 0
+                tiles.append(RatingTile(id: "rt", badge: "RT", badgeText: .white,
+                                        badgeFill: Color(hex: pct >= 60 ? "FA320A" : "5A9E3A"),
+                                        value: rt, caption: "Rotten Tomatoes"))
+            }
+            if let mc = s.metascore {
+                let score = Int(mc) ?? 0
+                let fill = score >= 61 ? "66CC33" : (score >= 40 ? "FFCC33" : "FF4D4D")
+                tiles.append(RatingTile(id: "mc", badge: "MC", badgeText: .black,
+                                        badgeFill: Color(hex: fill), value: mc, caption: "Metascore"))
+            }
+        }
+        // TMDB's own score, only when it really came from TMDB.
+        if let tmdb = tmdbDetails?.voteAverage ?? art.rating(for: item), !tmdb.isEmpty {
+            tiles.append(RatingTile(id: "tmdb", badge: "TMDB", badgeText: Color(hex: "0D253F"),
+                                    badgeFill: Color(hex: "01B4E4"), value: tmdb, caption: "TMDB"))
+        }
+        return tiles
+    }
+
+    /// "1,234,567" -> "1.2M", "29,210" -> "29.2K".
+    private static func compactVotes(_ raw: String) -> String {
+        guard let n = Double(raw.filter(\.isNumber)) else { return raw }
+        if n >= 1_000_000 { return String(format: "%.1fM", n / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fK", n / 1_000) }
+        return String(Int(n))
+    }
+
+    /// Ratings row under the hero (Chillio-style). Display only, no
+    /// focus targets, so the focus path hero -> cast is unchanged. Shows
+    /// nothing until a score is known.
+    @ViewBuilder
+    private var tvRatingsSection: some View {
+        let tiles = ratingTiles
+        if omdbScores?.hasScores == true || tiles.count > 1 {
+            VStack(alignment: .leading, spacing: 20) {
+                CinemaSectionTitle(title: "Ratings")
+                HStack(spacing: 64) {
+                    ForEach(tiles) { tile in
+                        HStack(spacing: 16) {
+                            Text(tile.badge)
+                                .font(.system(size: 22, weight: .heavy))  // logo-like badge: fixed size
+                                .foregroundColor(tile.badgeText)
+                                .padding(.horizontal, 12)
+                                .frame(minWidth: 64, minHeight: 52)
+                                .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(tile.badgeFill))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(tile.value)
+                                    .scaledFont(.system(size: 34, weight: .bold))
+                                    .foregroundColor(.textPrimary)
+                                Text(tile.caption)
+                                    .scaledFont(.system(size: 20).subtext())
+                                    .foregroundColor(Color.contrastText(.textTertiary))
+                            }
+                        }
+                        .accessibilityElement(children: .combine)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 56)
+            .padding(.top, 12)
+            .padding(.bottom, 32)
+        }
+    }
+
     @ViewBuilder
     private var tvDetailsBlock: some View {
         let facts = tvFacts
         if !facts.isEmpty {
             VStack(alignment: .leading, spacing: 16) {
-                Text("Details")
-                    .scaledFont(.headlineSmall)
-                    .foregroundColor(.textPrimary)
+                CinemaSectionTitle(title: "Details")
                 LazyVGrid(columns: [GridItem(.flexible(), alignment: .topLeading),
                                     GridItem(.flexible(), alignment: .topLeading)],
                           alignment: .leading, spacing: 18) {
@@ -1244,14 +1525,10 @@ struct VODDetailView: View {
                         .padding(.trailing, 40)
                     }
                 }
-                tmdbSourceNote
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 56)
             .padding(.top, 8)
-        } else {
-            tmdbSourceNote
-                .padding(.horizontal, 56)
         }
     }
     #endif
@@ -1442,8 +1719,6 @@ struct VODDetailView: View {
             if !country.isEmpty {
                 metaRow(label: "Country", value: country)
             }
-
-            tmdbSourceNote
         }
         // v1.6.12 (third pass): clamp infoSection to fill width
         // BEFORE padding so the .padding(.horizontal, 16) carves
@@ -2319,13 +2594,12 @@ struct VODDetailView: View {
         guard item.posterURL == nil, tmdbPosterURL == nil,
               TMDBPosters.isEnabled, let apiKey = TMDBPosters.apiKey else { return }
         let isMovie = (item.type != .series)
-        let tmdbID = item.movie?.tmdbID ?? item.series?.tmdbID
-            ?? fullMovie?.tmdbID ?? fullSeries?.tmdbID
+        let tmdbID = effectiveTMDBID
         var url: URL?
         if let id = tmdbID, !id.isEmpty {
             url = await TMDBService.posterURL(forTMDBID: id, isMovie: isMovie, apiKey: apiKey)
         }
-        if url == nil, !item.name.isEmpty {
+        if url == nil, matchOverride == nil, !item.name.isEmpty {
             url = await TMDBService.posterURL(forTitle: item.displayName, apiKey: apiKey)
         }
         if let url { tmdbPosterURL = url }
@@ -2360,17 +2634,130 @@ struct VODDetailView: View {
         let isMovie = item.type == .movie
         // fullMovie/fullSeries already merged provider-info over the list
         // row (provider wins), so prefer their id, then the raw row's.
-        let tmdbID = [fullMovie?.tmdbID, fullSeries?.tmdbID,
-                      item.movie?.tmdbID, item.series?.tmdbID]
-            .compactMap { $0 }
-            .first { !$0.isEmpty }
-        if let id = tmdbID,
+        if let id = effectiveTMDBID,
            let details = await TMDBService.details(forTMDBID: id, isMovie: isMovie, apiKey: apiKey) {
             tmdbDetails = details
             return
         }
-        guard !item.name.isEmpty else { return }
+        guard matchOverride == nil, !item.name.isEmpty else { return }
         tmdbDetails = await TMDBService.details(forTitle: item.tmdbSearchTitle, isMovie: isMovie, apiKey: apiKey)
+    }
+
+    /// OMDb scores for the Ratings row (tvOS layout only). Exact IMDb id
+    /// first, from the provider, then TMDB; a title + year search
+    /// otherwise. Runs after loadTMDBDetailsIfNeeded() so TMDB's id is in.
+    private func loadOMDbScoresIfNeeded() async {
+        guard usesTVMovieLayout, omdbScores == nil,
+              let apiKey = OMDbRatings.apiKey else { return }
+        let isMovie = item.type == .movie
+        let imdbID = [matchOverride?.imdbID, matchOverride == nil ? fullMovie?.imdbID : nil,
+                      matchOverride == nil ? item.movie?.imdbID : nil, tmdbDetails?.imdbID]
+            .compactMap { $0?.trimmingCharacters(in: .whitespaces) }
+            .first { $0.hasPrefix("tt") }
+        if let id = imdbID {
+            omdbScores = await OMDbService.scores(imdbID: id, apiKey: apiKey)
+            if omdbScores != nil { return }
+        }
+        guard matchOverride == nil, !item.name.isEmpty else { return }
+        omdbScores = await OMDbService.scores(title: item.tmdbSearchTitle, year: mergedYear,
+                                              isMovie: isMovie, apiKey: apiKey)
+    }
+
+    // MARK: - Saved info: refresh, fix match, reset match
+
+    /// The provider's TMDB id: the detail fetch first, then the list row.
+    private var providerTMDBID: String? {
+        [fullMovie?.tmdbID, fullSeries?.tmdbID, item.movie?.tmdbID, item.series?.tmdbID]
+            .compactMap { $0 }
+            .first { !$0.isEmpty }
+    }
+
+    /// The TMDB title this page shows: a Fix Match pick, else the provider's.
+    private var effectiveTMDBID: String? {
+        matchOverride?.tmdbID ?? providerTMDBID
+    }
+
+    /// Every id and title this page may have saved data under, so a
+    /// refresh leaves nothing stale behind.
+    private func forgetSavedInfo() {
+        let isMovie = item.type == .movie
+        let tmdbIDs = [matchOverride?.tmdbID, providerTMDBID,
+                       TMDBArtCache.shared.tmdbID(for: item), seriesTMDBID].compactMap { $0 }
+        let titles = [item.displayName, item.tmdbSearchTitle]
+        TMDBService.forgetTitle(tmdbIDs: tmdbIDs, titles: titles, isMovie: isMovie)
+        let imdbIDs = [matchOverride?.imdbID, fullMovie?.imdbID, item.movie?.imdbID, tmdbDetails?.imdbID]
+            .compactMap { $0 }.filter { !$0.isEmpty }
+        OMDbService.forget(imdbIDs: imdbIDs, titles: [item.tmdbSearchTitle], year: mergedYear, isMovie: isMovie)
+    }
+
+    /// Clear this page's TMDB / OMDb state and load it again. The loaders
+    /// read the saved files first, so after a forget they hit the network.
+    @MainActor
+    private func reloadSavedInfo() async {
+        tmdbDetails = nil
+        tmdbCredits = nil
+        omdbScores = nil
+        tmdbPosterURL = nil
+        relatedCandidates = []
+        relatedItems = []
+        relatedMatchedCount = -1
+        seriesTMDBID = nil
+        #if os(tvOS)
+        tmdbBackdropURL = nil
+        seasonInfo = [:]
+        #endif
+        await loadTMDBDetailsIfNeeded()
+        await loadOMDbScoresIfNeeded()
+        await loadTMDBCreditsIfNeeded()
+        await loadTMDBPosterIfNeeded()
+        #if os(tvOS)
+        await loadTMDBBackdropIfNeeded()
+        #endif
+        await loadRelatedIfNeeded()
+    }
+
+    /// Refresh Info: fetch this title again from TMDB and OMDb, keeping a
+    /// Fix Match pick.
+    @MainActor
+    private func refreshSavedInfo() async {
+        forgetSavedInfo()
+        if let pinned = matchOverride {
+            if let apiKey = TMDBPosters.apiKey {
+                let details = await TMDBService.details(forTMDBID: pinned.tmdbID,
+                                                        isMovie: item.type == .movie, apiKey: apiKey)
+                TMDBArtCache.shared.pin(item, tmdbID: pinned.tmdbID, details: details)
+            }
+        } else {
+            await TMDBArtCache.shared.refresh(item)
+        }
+        await reloadSavedInfo()
+    }
+
+    /// Fix Match: show this TMDB title for this item from now on.
+    @MainActor
+    private func applyMatch(_ candidate: TMDBMatchCandidate) async {
+        forgetSavedInfo()
+        let isMovie = item.type == .movie
+        var details: TMDBDetails?
+        if let apiKey = TMDBPosters.apiKey {
+            details = await TMDBService.details(forTMDBID: candidate.id, isMovie: isMovie, apiKey: apiKey)
+        }
+        let pick = MetadataMatchOverrides.Match(tmdbID: candidate.id, imdbID: details?.imdbID)
+        MetadataMatchOverrides.set(pick, for: item)
+        matchOverride = pick
+        TMDBArtCache.shared.pin(item, tmdbID: candidate.id, details: details)
+        debugLog("🎬 Fix Match '\(item.displayName)' -> TMDB \(candidate.id) (\(candidate.title) \(candidate.year))")
+        await reloadSavedInfo()
+    }
+
+    /// Reset Match: back to automatic matching.
+    @MainActor
+    private func resetMatch() async {
+        forgetSavedInfo()
+        MetadataMatchOverrides.set(nil, for: item)
+        matchOverride = nil
+        await TMDBArtCache.shared.refresh(item)
+        await reloadSavedInfo()
     }
 
     /// Structured credits for the Cast & Crew strip. Same settled gate as
@@ -2384,16 +2771,12 @@ struct VODDetailView: View {
               TMDBPosters.isEnabled,
               let apiKey = TMDBPosters.apiKey else { return }
         let isMovie = item.type == .movie
-        let tmdbID = [fullMovie?.tmdbID, fullSeries?.tmdbID,
-                      item.movie?.tmdbID, item.series?.tmdbID]
-            .compactMap { $0 }
-            .first { !$0.isEmpty }
-        if let id = tmdbID,
+        if let id = effectiveTMDBID,
            let credits = await TMDBService.credits(forTMDBID: id, isMovie: isMovie, apiKey: apiKey) {
             tmdbCredits = credits
             return
         }
-        guard !item.name.isEmpty else { return }
+        guard matchOverride == nil, !item.name.isEmpty else { return }
         tmdbCredits = await TMDBService.credits(forTitle: item.displayName, isMovie: isMovie, apiKey: apiKey)
     }
 
@@ -2435,9 +2818,15 @@ struct VODDetailView: View {
         let row = rowPeople
         if !row.people.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                Text(row.title)
-                    .scaledFont(.headlineSmall)
-                    .foregroundColor(.textPrimary)
+                Group {
+                    #if os(tvOS)
+                    CinemaSectionTitle(title: row.title)
+                    #else
+                    Text(row.title)
+                        .scaledFont(.headlineSmall)
+                        .foregroundColor(.textPrimary)
+                    #endif
+                }
                     .padding(.horizontal, usesTVMovieLayout ? 56 : 16)
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: usesTVMovieLayout ? 24 : 12) {
@@ -2482,6 +2871,15 @@ struct VODDetailView: View {
     /// sheet shows the miss message). On success the sheet is dismissed
     /// first so remote Back from the pushed title returns here with the
     /// sheet closed.
+    /// A Known For title the library has: close the bio, then push it.
+    private func openFromBio(_ hit: VODDisplayItem) {
+        bioPerson = nil
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            pushDetail(hit)
+        }
+    }
+
     private func resolveKnownFor(_ kf: TMDBKnownForItem) async -> Bool {
         guard let hit = await VODStore.shared.resolveKnownForItem(kf, server: server) else {
             return false
@@ -2933,7 +3331,7 @@ private struct PersonCard: View {
     let onSelect: () -> Void
 
     #if os(tvOS)
-    private let cardWidth: CGFloat = 200
+    private let cardWidth: CGFloat = 180
     #else
     private let cardWidth: CGFloat = 90
     #endif
@@ -2949,7 +3347,7 @@ private struct PersonCard: View {
             Button(action: onSelect) {
                 photo
             }
-            .buttonStyle(.card)
+            .buttonStyle(CinemaCardFocusStyle(cornerRadius: cardWidth / 2))
             VStack(spacing: 2) {
                 Text(person.name)
                     .scaledFont(.labelMedium)
@@ -3009,8 +3407,14 @@ private struct PersonCard: View {
                         personGlyph
                     }
                 }
+                #if os(tvOS)
+                // Round headshots, like the Apple TV app.
+                .frame(width: cardWidth, height: cardWidth)
+                .clipShape(Circle())
+                #else
                 .frame(width: cardWidth, height: cardWidth * 1.5)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                #endif
     }
 
     private var personGlyph: some View {
@@ -3036,9 +3440,18 @@ private struct PersonBioSheet: View {
     /// is not in the user's library (the sheet shows the miss message);
     /// on success the parent dismisses this sheet and pushes the title.
     let resolve: (TMDBKnownForItem) async -> Bool
+    /// Opens a Known For title that is in the library (dismiss + push).
+    let open: (VODDisplayItem) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var bio: TMDBPersonBio?
+    /// Known For titles the library has, by TMDB id. Only these are shown:
+    /// a title the provider does not carry would do nothing when selected.
+    @State private var inLibrary: [String: VODDisplayItem] = [:]
+
+    private var playableKnownFor: [TMDBKnownForItem] {
+        (bio?.knownFor ?? []).filter { inLibrary[$0.id] != nil }
+    }
     @State private var loaded = false
     /// Double-fire latch: a Known For resolve can hit the network; a
     /// second press while one is in flight would stack two pushes.
@@ -3132,6 +3545,9 @@ private struct PersonBioSheet: View {
                 return
             }
             bio = await TMDBService.personBio(forID: person.id, apiKey: key)
+            if let items = bio?.knownFor, !items.isEmpty {
+                inLibrary = await VODStore.shared.libraryMatches(items)
+            }
             loaded = true
         }
     }
@@ -3160,7 +3576,8 @@ private struct PersonBioSheet: View {
 
     @ViewBuilder
     private var tvKnownForStrip: some View {
-        if let items = bio?.knownFor, !items.isEmpty {
+        let items = playableKnownFor
+        if !items.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Known For")
                     .scaledFont(.headlineSmall)
@@ -3269,6 +3686,9 @@ private struct PersonBioSheet: View {
                 return
             }
             bio = await TMDBService.personBio(forID: person.id, apiKey: key)
+            if let items = bio?.knownFor, !items.isEmpty {
+                inLibrary = await VODStore.shared.libraryMatches(items)
+            }
             loaded = true
         }
     }
@@ -3321,7 +3741,8 @@ private struct PersonBioSheet: View {
 
     @ViewBuilder
     private var knownForStrip: some View {
-        if let items = bio?.knownFor, !items.isEmpty {
+        let items = playableKnownFor
+        if !items.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Known For")
                     .scaledFont(.headlineSmall)
@@ -3371,6 +3792,10 @@ private struct PersonBioSheet: View {
 
     private func tapKnownFor(_ item: TMDBKnownForItem) {
         guard !resolving else { return }
+        if let hit = inLibrary[item.id] {
+            open(hit)
+            return
+        }
         resolving = true
         Task { @MainActor in
             let found = await resolve(item)
@@ -3414,6 +3839,33 @@ extension VODStore {
     /// resolve its own item. XC sources load their whole library up
     /// front, making a loaded-list miss a real miss: the server fallback
     /// is skipped there.
+    /// TMDB titles (Known For, Related) that the library has, by TMDB id.
+    /// Local only, no network: the provider's TMDB id, then titles the
+    /// poster lookup matched to that TMDB id, then an exact title match
+    /// for rows that carry no id.
+    @MainActor
+    func libraryMatches(_ items: [TMDBKnownForItem]) async -> [String: VODDisplayItem] {
+        var out: [String: VODDisplayItem] = [:]
+        for isMovie in [true, false] {
+            let group = items.filter { $0.isMovie == isMovie }
+            guard !group.isEmpty else { continue }
+            let kind: VODItemType = isMovie ? .movie : .series
+            let ids = group.map(\.id)
+            let byID = await itemsByTMDBID(kind: kind, tmdbIDs: ids)
+            let clean = TMDBArtCache.shared.cleanTitles(forTMDBIDs: ids, isMovie: isMovie)
+            let byClean = await itemsByCleanTitles(kind: kind, cleanTitles: Array(Set(clean.values)))
+            let byTitle = await itemsByNormalizedTitle(
+                kind: kind, titles: group.map { Self.normalizeVodTitle($0.title) }, requireNoTMDBID: true)
+            for kf in group {
+                if let hit = byID[kf.id] ?? clean[kf.id].flatMap({ byClean[$0] })
+                    ?? byTitle[Self.normalizeVodTitle(kf.title)] {
+                    out[kf.id] = hit
+                }
+            }
+        }
+        return out
+    }
+
     @MainActor
     func resolveKnownForItem(_ kf: TMDBKnownForItem, server: ServerConnection?) async -> VODDisplayItem? {
         let kind: VODItemType = kf.isMovie ? .movie : .series
@@ -3465,3 +3917,126 @@ extension VODStore {
         return hit
     }
 }
+
+#if os(tvOS)
+// MARK: - Fix Match (pick the right TMDB title by hand)
+
+/// Full-screen picker behind the detail page's ⋯ > Fix Match. Searches
+/// TMDB by title (a year narrows it: "Dune 2021"), or takes a TMDB id
+/// ("438631") or an IMDb id ("tt1160419"). Picking a result calls
+/// `onPick`; Menu closes without changes.
+struct FixMatchView: View {
+    @ObservedObject private var themeLive = ThemeManager.shared
+    let initialQuery: String
+    let isMovie: Bool
+    let currentTMDBID: String?
+    let onPick: (TMDBMatchCandidate) -> Void
+
+    @State private var query = ""
+    @State private var results: [TMDBMatchCandidate] = []
+    @State private var isSearching = false
+    @State private var searchedOnce = false
+
+    var body: some View {
+        ZStack {
+            Color.appBackground.ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 28) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Fix Match")
+                        .scaledFont(.displaySmall)
+                        .foregroundColor(.textPrimary)
+                    Text("Pick the right \(isMovie ? "movie" : "show"). Search by title, add a year to narrow it down, or enter a TMDB or IMDb id.")
+                        .scaledFont(.bodySmall.subtext())
+                        .foregroundColor(Color.contrastText(.textSecondary))
+                }
+
+                HStack(spacing: 20) {
+                    TextField("Title, TMDB id or IMDb id", text: $query)
+                        .scaledFont(.system(size: 28))
+                        .frame(width: 900)
+                        .onSubmit { Task { await search() } }
+                    Button {
+                        Task { await search() }
+                    } label: {
+                        Label("Search", systemImage: "magnifyingglass")
+                    }
+                    if isSearching { ProgressView() }
+                }
+                .focusSection()
+
+                if results.isEmpty {
+                    Text(searchedOnce && !isSearching ? "No matches. Try another spelling, drop the year, or use an id." : " ")
+                        .scaledFont(.bodyMedium.subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                        .padding(.top, 40)
+                    Spacer()
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(alignment: .top, spacing: 40) {
+                            ForEach(results) { c in
+                                Button { onPick(c) } label: {
+                                    candidateCard(c)
+                                }
+                                .buttonStyle(.card)
+                            }
+                        }
+                        .padding(.vertical, 40)
+                        .padding(.horizontal, 8)
+                    }
+                    .focusSection()
+                    Spacer()
+                }
+            }
+            .padding(.horizontal, 90)
+            .padding(.vertical, 60)
+        }
+        .task {
+            query = initialQuery
+            await search()
+        }
+    }
+
+    private func candidateCard(_ c: TMDBMatchCandidate) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ZStack {
+                Color.cardBackground
+                if let path = c.posterPath, let url = TMDBService.imageURL(path: path, size: "w342") {
+                    AsyncImage(url: url) { img in
+                        img.resizable().aspectRatio(contentMode: .fill)
+                    } placeholder: { Color.cardBackground }
+                } else {
+                    Image(systemName: isMovie ? "film" : "tv")
+                        .font(.system(size: 48))
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                }
+            }
+            .frame(width: 240, height: 360)
+            .clipped()
+            VStack(alignment: .leading, spacing: 4) {
+                Text(c.title)
+                    .scaledFont(.system(size: 24, weight: .semibold))
+                    .foregroundColor(.textPrimary)
+                    .lineLimit(2)
+                HStack(spacing: 8) {
+                    if !c.year.isEmpty { Text(c.year) }
+                    if c.id == currentTMDBID { Text("· Current").foregroundColor(.accentPrimary) }
+                }
+                .scaledFont(.system(size: 20).subtext())
+                .foregroundColor(Color.contrastText(.textSecondary))
+            }
+            .frame(width: 240, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 12)
+        }
+    }
+
+    @MainActor
+    private func search() async {
+        guard let apiKey = TMDBPosters.apiKey else { return }
+        isSearching = true
+        results = await TMDBService.matchCandidates(query: query, isMovie: isMovie, apiKey: apiKey)
+        isSearching = false
+        searchedOnce = true
+    }
+}
+#endif

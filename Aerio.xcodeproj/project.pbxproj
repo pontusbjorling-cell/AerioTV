@@ -77,6 +77,8 @@
 		1D11DF914E50BF1810089A1E /* XtreamSeriesAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F9F2E0DF2867ED959950125 /* XtreamSeriesAPI.swift */; };
 		1EB4A645E88DDFE6F211ADA4 /* Pods-Aerio_iOS-acknowledgements.markdown in Resources */ = {isa = PBXBuildFile; fileRef = 8FEC2B12EB3FCB8C13AD3FD1 /* Pods-Aerio_iOS-acknowledgements.markdown */; };
 		1FF8FD4B1DD11EAE3F154767 /* MoviesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF6E46AD7A6F742E358FBB43 /* MoviesView.swift */; };
+		C1A0E5A1B2C3D4E5F6A7B802 /* CinemaHome.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A0E5A1B2C3D4E5F6A7B801 /* CinemaHome.swift */; };
+		C1A0E5A1B2C3D4E5F6A7B803 /* CinemaHome.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A0E5A1B2C3D4E5F6A7B801 /* CinemaHome.swift */; };
 		2035A9C0AA2BB5352728DCAA /* PhoneMediaPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E74BEC0CC7E72B10B46A328 /* PhoneMediaPage.swift */; };
 		20CC28AE47FF3B777AFB9EA1 /* MoviesTVSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF6885859E2CB3D72D89F4E0 /* MoviesTVSettingsView.swift */; };
 		23CF3BDA1A62692EC1141F06 /* AerioTopShelf.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 980F01E6377A91F10236C4D5 /* AerioTopShelf.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -656,6 +658,7 @@
 		BD9D88342F84B8870005EA3D /* CarPlay.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CarPlay.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.4.sdk/System/Library/Frameworks/CarPlay.framework; sourceTree = DEVELOPER_DIR; };
 		BDB64C242F6C5895008EF9EF /* Aerio_tvOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Aerio_tvOS.entitlements; sourceTree = "<group>"; };
 		BF6E46AD7A6F742E358FBB43 /* MoviesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MoviesView.swift; sourceTree = "<group>"; };
+		C1A0E5A1B2C3D4E5F6A7B801 /* CinemaHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaHome.swift; sourceTree = "<group>"; };
 		C384E19782307C7D03F8F60B /* Colors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Colors.swift; sourceTree = "<group>"; };
 		C41DDA8474CA1A75D88D9E3C /* MobileVLCKit-xcframeworks-output-files.xcfilelist */ = {isa = PBXFileReference; lastKnownFileType = text.xcfilelist; path = "MobileVLCKit-xcframeworks-output-files.xcfilelist"; sourceTree = "<group>"; };
 		C5B3F5A632594CCFBF0752AA /* OpenSourceLicensesView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = OpenSourceLicensesView.swift; sourceTree = "<group>"; };
@@ -1152,6 +1155,7 @@
 			isa = PBXGroup;
 			children = (
 				BF6E46AD7A6F742E358FBB43 /* MoviesView.swift */,
+				C1A0E5A1B2C3D4E5F6A7B801 /* CinemaHome.swift */,
 				5E74BEC0CC7E72B10B46A328 /* PhoneMediaPage.swift */,
 				D833EF1D35443BFAEE1480B5 /* TVShowsView.swift */,
 				20C769771A1085A303FFC0F0 /* VODDetailView.swift */,
@@ -1638,6 +1642,7 @@
 				5DC1FF775CB2D3D2917F5D4A /* MediaServerAPIs.swift in Sources */,
 				1083DB8B620ABAC3ECAB3823 /* Models.swift in Sources */,
 				1FF8FD4B1DD11EAE3F154767 /* MoviesView.swift in Sources */,
+				C1A0E5A1B2C3D4E5F6A7B802 /* CinemaHome.swift in Sources */,
 				2035A9C0AA2BB5352728DCAA /* PhoneMediaPage.swift in Sources */,
 				B48FFF1CCE32418C749A56D5 /* DVRView.swift in Sources */,
 				EF0A0507929D52B20126EBDB /* DVRArtResolver.swift in Sources */,
@@ -1846,6 +1851,7 @@
 				AD422FFDD689840F76B8A238 /* MediaServerAPIs.swift in Sources */,
 				30FA1CA916C8DDE2001C592F /* Models.swift in Sources */,
 				DA8D78550B95A889171982BC /* MoviesView.swift in Sources */,
+				C1A0E5A1B2C3D4E5F6A7B803 /* CinemaHome.swift in Sources */,
 				901047E69DDB4F9633B3CCC3 /* PhoneMediaPage.swift in Sources */,
 				7AA2C488BA2252BB6003C40E /* DVRView.swift in Sources */,
 				47124970CDB0AF253294C1D7 /* DVRArtResolver.swift in Sources */,

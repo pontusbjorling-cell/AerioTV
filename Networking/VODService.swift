@@ -1010,6 +1010,379 @@ extension Notification.Name {
     static let tmdbAPIKeyDidChange = Notification.Name("aerio.tmdbAPIKeyDidChange")
 }
 
+// MARK: - Saved title metadata (detail page data on disk)
+
+/// TMDB and OMDb answers for the detail page (details, cast, related,
+/// episode info, ratings), kept on disk so a title is fetched ONCE rather
+/// than on every launch. Rules:
+/// - A found answer is kept until the user asks for fresh data (Refresh
+///   Info, Fix Match, or Clear Saved Info in Settings). OMDb ratings are
+///   the one exception: they quietly refresh after 30 days.
+/// - "Not found" is kept too, and retried after 30 days.
+/// - A transport error is never saved, so it is retried next time.
+/// Lives in the rebuildable cache directory (Caches on tvOS): if the
+/// system purges it, titles are simply fetched again. One small file per
+/// answer, grouped per TMDB title so Refresh can drop a title's files.
+enum MetadataDiskCache {
+    struct Record<T: Codable>: Codable {
+        var at: Date
+        /// nil = the service answered "not found".
+        var value: T?
+    }
+
+    /// Retry window for "not found" answers and OMDb's soft expiry.
+    static let retryAfter: TimeInterval = 30 * 86_400
+
+    private static var root: URL {
+        AppCacheDirectory.url.appendingPathComponent("title-metadata", isDirectory: true)
+    }
+
+    /// File-system-safe name; lossy or long names get a stable hash suffix
+    /// so two different keys can never share a file.
+    static func safeName(_ raw: String) -> String {
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        let mapped = String(raw.map { allowed.contains($0) ? $0 : "_" })
+        guard mapped != raw || raw.count > 80 else { return raw }
+        var hash: UInt64 = 0xcbf29ce484222325   // FNV-1a 64
+        for b in raw.utf8 { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
+        return String(mapped.prefix(60)) + "-" + String(hash, radix: 16)
+    }
+
+    private static func fileURL(group: String, name: String) -> URL {
+        root.appendingPathComponent(safeName(group), isDirectory: true)
+            .appendingPathComponent(safeName(name) + ".json")
+    }
+
+    static func load<T: Codable>(_ type: T.Type, group: String, name: String) -> Record<T>? {
+        guard let data = try? Data(contentsOf: fileURL(group: group, name: name)) else { return nil }
+        return try? JSONDecoder().decode(Record<T>.self, from: data)
+    }
+
+    static func save<T: Codable>(_ value: T?, group: String, name: String) {
+        let url = fileURL(group: group, name: name)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(Record(at: Date(), value: value))
+            try data.write(to: url, options: .atomic)
+        } catch {
+            debugLog("[META-CACHE] save \(group)/\(name) failed: \(error.localizedDescription)")
+        }
+    }
+
+    static func remove(group: String, name: String) {
+        try? FileManager.default.removeItem(at: fileURL(group: group, name: name))
+    }
+
+    static func removeGroup(_ group: String) {
+        try? FileManager.default.removeItem(at: root.appendingPathComponent(safeName(group), isDirectory: true))
+    }
+
+    static func removeAll() {
+        try? FileManager.default.removeItem(at: root)
+        debugLog("[META-CACHE] cleared all saved title metadata")
+    }
+
+    /// Bytes on disk, for the Settings row.
+    static func diskSize() -> Int {
+        guard let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var total = 0
+        for case let url as URL in walker {
+            total += (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        }
+        return total
+    }
+
+    /// The group holding everything saved for one TMDB title.
+    static func tmdbGroup(kind: String, id: String) -> String { "tmdb-\(kind)-\(id)" }
+}
+
+/// Titles the user matched by hand with Fix Match. Keyed like the TMDB art
+/// cache (type + cleaned title), so the grid poster and the detail page
+/// agree. A fixed match wins over the provider's id and any title search,
+/// and nothing automatic replaces it; Reset Match removes it. Kept in
+/// UserDefaults, not the cache directory: it is the user's choice and must
+/// survive the system purging Caches.
+@MainActor
+enum MetadataMatchOverrides {
+    struct Match: Codable, Equatable, Sendable {
+        var tmdbID: String
+        var imdbID: String?
+    }
+
+    private static let defaultsKey = "aerio.metadataMatchOverrides"
+
+    private static var all: [String: Match] {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+                  let map = try? JSONDecoder().decode([String: Match].self, from: data) else { return [:] }
+            return map
+        }
+        set {
+            if let data = try? JSONEncoder().encode(newValue) {
+                UserDefaults.standard.set(data, forKey: defaultsKey)
+            }
+        }
+    }
+
+    static func match(for item: VODDisplayItem) -> Match? {
+        all[TMDBArtCache.key(for: item)]
+    }
+
+    static func set(_ match: Match?, for item: VODDisplayItem) {
+        var map = all
+        map[TMDBArtCache.key(for: item)] = match
+        all = map
+    }
+
+    static var count: Int { all.count }
+}
+
+/// Outcome of a Settings "Test" press, with the reason when it fails so
+/// the screen can say why (an empty field, no connection and a rejected
+/// key used to all read "Invalid key").
+enum APIKeyCheck: Equatable, Sendable {
+    case valid
+    case empty
+    /// The service answered and refused the key; the text is its reason.
+    case rejected(String)
+    /// No usable answer (offline, timeout, server error).
+    case unreachable(String)
+}
+
+/// One row in Fix Match's results.
+struct TMDBMatchCandidate: Identifiable, Sendable, Equatable {
+    let id: String
+    let title: String
+    let year: String
+    let posterPath: String?
+    let overview: String
+}
+
+// MARK: - OMDb ratings (IMDb, Rotten Tomatoes, Metacritic)
+
+/// The user's OMDb API key (omdbapi.com), which unlocks the IMDb, Rotten
+/// Tomatoes and Metacritic scores on the detail page. Stored like the TMDB
+/// key: Keychain, synced through iCloud Keychain, never UserDefaults or
+/// git. Not part of Dispatcharr Sync. No key = the ratings row stays off.
+enum OMDbRatings {
+    static let keychainKey = "omdbAPIKey"
+
+    static var apiKey: String? {
+        let k = loadAPIKey()
+        return k.isEmpty ? nil : k
+    }
+
+    static func loadAPIKey() -> String {
+        if let synced = KeychainHelper.load(key: keychainKey, synchronizable: true),
+           !synced.isEmpty { return synced }
+        return KeychainHelper.load(key: keychainKey, synchronizable: false) ?? ""
+    }
+
+    static func saveAPIKey(_ key: String) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        KeychainHelper.delete(keychainKey, synchronizable: false)
+        if trimmed.isEmpty {
+            KeychainHelper.delete(keychainKey, synchronizable: true)
+        } else {
+            KeychainHelper.save(trimmed, for: keychainKey, synchronizable: true)
+        }
+        OMDbService.clearCache()
+    }
+}
+
+/// Display-ready scores from one OMDb record. "N/A" fields are nil.
+struct OMDbScores: Sendable, Equatable, Codable {
+    /// IMDb user rating, "7.9".
+    var imdbRating: String?
+    /// IMDb vote count as OMDb sends it, "1,234,567".
+    var imdbVotes: String?
+    /// Rotten Tomatoes Tomatometer, "94%".
+    var rottenTomatoes: String?
+    /// Metacritic Metascore, "79".
+    var metascore: String?
+    /// Content rating, "PG-13".
+    var rated: String?
+
+    var hasScores: Bool { imdbRating != nil || rottenTomatoes != nil || metascore != nil }
+}
+
+/// Minimal OMDb client: one record per title, by IMDb id when known,
+/// otherwise by title (+ year). Results, hits and definitive misses, are
+/// cached in memory for the session.
+enum OMDbService {
+    private static let base = "https://www.omdbapi.com/"
+
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15
+        return URLSession(configuration: config)
+    }()
+
+    private final class Entry: NSObject {
+        let value: OMDbScores?
+        init(_ value: OMDbScores?) { self.value = value }
+    }
+    nonisolated(unsafe) private static let cache = NSCache<NSString, Entry>()
+
+    private struct Response: Decodable {
+        let response: String?
+        let rated: String?
+        let imdbRating: String?
+        let imdbVotes: String?
+        let metascore: String?
+        let ratings: [Rating]?
+        struct Rating: Decodable {
+            let source: String?
+            let value: String?
+            enum CodingKeys: String, CodingKey {
+                case source = "Source"
+                case value = "Value"
+            }
+        }
+        enum CodingKeys: String, CodingKey {
+            case response = "Response"
+            case rated = "Rated"
+            case imdbRating, imdbVotes
+            case metascore = "Metascore"
+            case ratings = "Ratings"
+        }
+    }
+
+    static func clearCache() { cache.removeAllObjects() }
+
+    /// Saved OMDb answers live in one group of MetadataDiskCache.
+    private static let diskGroup = "omdb"
+
+    private static func idKey(_ id: String) -> String { "i:\(id)" }
+    private static func titleKey(_ title: String, year: String, isMovie: Bool) -> String {
+        "t:\(isMovie ? "m" : "s"):\(title.lowercased()):\(year)"
+    }
+
+    /// Drop the saved scores for one title (Refresh Info / Fix Match), by
+    /// id and by title, from memory and disk.
+    static func forget(imdbIDs: [String], titles: [String], year: String?, isMovie: Bool) {
+        let y = (year ?? "").trimmingCharacters(in: .whitespaces)
+        var keys = imdbIDs.map { idKey($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        for t in titles {
+            let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            keys.append(titleKey(trimmed, year: y.count == 4 ? y : "", isMovie: isMovie))
+            keys.append(titleKey(trimmed, year: "", isMovie: isMovie))
+        }
+        for k in keys {
+            cache.removeObject(forKey: k as NSString)
+            MetadataDiskCache.remove(group: diskGroup, name: k)
+        }
+    }
+
+    /// Scores by exact IMDb id ("tt0371746").
+    static func scores(imdbID: String, apiKey: String) async -> OMDbScores? {
+        let id = imdbID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard id.hasPrefix("tt") else { return nil }
+        return await fetch([URLQueryItem(name: "i", value: id)], cacheKey: idKey(id), apiKey: apiKey)
+    }
+
+    /// Scores by title, narrowed by year and type when given. Used when
+    /// neither the provider nor TMDB supplied an IMDb id.
+    static func scores(title: String, year: String?, isMovie: Bool, apiKey: String) async -> OMDbScores? {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return nil }
+        var items = [URLQueryItem(name: "t", value: t),
+                     URLQueryItem(name: "type", value: isMovie ? "movie" : "series")]
+        let y = (year ?? "").trimmingCharacters(in: .whitespaces)
+        if y.count == 4 { items.append(URLQueryItem(name: "y", value: y)) }
+        return await fetch(items, cacheKey: titleKey(t, year: y.count == 4 ? y : "", isMovie: isMovie), apiKey: apiKey)
+    }
+
+    /// Whether OMDb accepts the key (a known title resolves), with OMDb's
+    /// own reason when it does not ("Invalid API key!", "Request limit
+    /// reached!"). New OMDb keys only work after the activation link in
+    /// OMDb's email has been opened.
+    static func checkKey(_ key: String) async -> APIKeyCheck {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            debugLog("🍅 OMDb key test: field empty")
+            return .empty
+        }
+        guard let req = request([URLQueryItem(name: "i", value: "tt0111161")], apiKey: trimmed) else {
+            return .unreachable("Bad request")
+        }
+        let data: Data
+        let http: HTTPURLResponse
+        do {
+            let (d, r) = try await session.data(for: req)
+            guard let h = r as? HTTPURLResponse else { return .unreachable("No HTTP response") }
+            data = d; http = h
+        } catch {
+            debugLog("🍅 OMDb key test: length \(trimmed.count), network error \(error.localizedDescription)")
+            return .unreachable(error.localizedDescription)
+        }
+        struct Answer: Decodable {
+            let response: String?
+            let error: String?
+            enum CodingKeys: String, CodingKey { case response = "Response", error = "Error" }
+        }
+        let answer = try? JSONDecoder().decode(Answer.self, from: data)
+        debugLog("🍅 OMDb key test: length \(trimmed.count), HTTP \(http.statusCode), response \(answer?.response ?? "-"), error \(answer?.error ?? "-")")
+        if answer?.response == "True" { return .valid }
+        if http.statusCode == 401 || answer?.error != nil {
+            return .rejected(answer?.error ?? "HTTP \(http.statusCode)")
+        }
+        return .unreachable("HTTP \(http.statusCode)")
+    }
+
+    private static func request(_ items: [URLQueryItem], apiKey: String) -> URLRequest? {
+        guard var comps = URLComponents(string: base) else { return nil }
+        comps.queryItems = items + [URLQueryItem(name: "apikey", value: apiKey)]
+        guard let url = comps.url else { return nil }
+        return URLRequest(url: url)
+    }
+
+    private static func fetch(_ items: [URLQueryItem], cacheKey: String, apiKey: String) async -> OMDbScores? {
+        let key = cacheKey as NSString
+        if let hit = cache.object(forKey: key) { return hit.value }
+        // Saved answer younger than 30 days: no network at all.
+        let saved = MetadataDiskCache.load(OMDbScores.self, group: diskGroup, name: cacheKey)
+        if let saved, Date().timeIntervalSince(saved.at) < MetadataDiskCache.retryAfter {
+            cache.setObject(Entry(saved.value), forKey: key)
+            return saved.value
+        }
+        // Nothing saved, or older than 30 days: ask OMDb. If that fails,
+        // keep showing the older scores rather than none.
+        guard let req = request(items, apiKey: apiKey),
+              let (data, resp) = try? await session.data(for: req),
+              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let decoded = try? JSONDecoder().decode(Response.self, from: data)
+        else {
+            if let old = saved?.value { cache.setObject(Entry(old), forKey: key) }
+            return saved?.value   // transport or key error: nothing new saved
+        }
+        guard decoded.response == "True" else {
+            cache.setObject(Entry(nil), forKey: key)   // OMDb has no such title
+            MetadataDiskCache.save(OMDbScores?.none, group: diskGroup, name: cacheKey)
+            return nil
+        }
+        func clean(_ s: String?) -> String? {
+            guard let v = s?.trimmingCharacters(in: .whitespaces), !v.isEmpty, v != "N/A" else { return nil }
+            return v
+        }
+        let rt = clean(decoded.ratings?.first { $0.source == "Rotten Tomatoes" }?.value)
+        let mcFromList = clean(decoded.ratings?.first { $0.source == "Metacritic" }?.value)
+            .map { String($0.prefix { $0 != "/" }) }
+        let scores = OMDbScores(
+            imdbRating: clean(decoded.imdbRating),
+            imdbVotes: clean(decoded.imdbVotes),
+            rottenTomatoes: rt,
+            metascore: clean(decoded.metascore) ?? mcFromList,
+            rated: clean(decoded.rated)
+        )
+        cache.setObject(Entry(scores), forKey: key)
+        MetadataDiskCache.save(scores, group: diskGroup, name: cacheKey)
+        debugLog("🍅 OMDb \(cacheKey) -> imdb \(scores.imdbRating ?? "-") rt \(scores.rottenTomatoes ?? "-") mc \(scores.metascore ?? "-")")
+        return scores
+    }
+}
+
 // MARK: - TMDB client (poster-by-title + key validation)
 
 /// Minimal TMDB v3 client used only to (a) validate the user's API key
@@ -1080,12 +1453,38 @@ enum TMDBService {
 
     /// Validate a credential by hitting `/configuration`. 200 = valid.
     static func validateKey(_ key: String) async -> Bool {
+        await checkKey(key) == .valid
+    }
+
+    /// Like validateKey, with the reason when the key does not work.
+    static func checkKey(_ key: String) async -> APIKeyCheck {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              let req = makeRequest(path: "/configuration", key: trimmed) else { return false }
-        guard let (_, resp) = try? await session.data(for: req),
-              let http = resp as? HTTPURLResponse else { return false }
-        return http.statusCode == 200
+        guard !trimmed.isEmpty else {
+            debugLog("🎬 TMDB key test: field empty")
+            return .empty
+        }
+        guard let req = makeRequest(path: "/configuration", key: trimmed) else { return .unreachable("Bad request") }
+        let data: Data
+        let http: HTTPURLResponse
+        do {
+            let (d, r) = try await session.data(for: req)
+            guard let h = r as? HTTPURLResponse else { return .unreachable("No HTTP response") }
+            data = d; http = h
+        } catch {
+            debugLog("🎬 TMDB key test: length \(trimmed.count), network error \(error.localizedDescription)")
+            return .unreachable(error.localizedDescription)
+        }
+        struct Answer: Decodable {
+            let statusMessage: String?
+            enum CodingKeys: String, CodingKey { case statusMessage = "status_message" }
+        }
+        let message = (try? JSONDecoder().decode(Answer.self, from: data))?.statusMessage
+        debugLog("🎬 TMDB key test: length \(trimmed.count), bearer \(isBearerToken(trimmed)), HTTP \(http.statusCode), message \(message ?? "-")")
+        switch http.statusCode {
+        case 200: return .valid
+        case 401, 403: return .rejected(message ?? "HTTP \(http.statusCode)")
+        default: return .unreachable(message ?? "HTTP \(http.statusCode)")
+        }
     }
 
     /// Look up a poster image URL for a program title via
@@ -1296,7 +1695,7 @@ enum TMDBService {
 /// Display-ready detail fields backfilled from TMDB when the server and
 /// provider-info leave them blank. Every field optional; blank strings are
 /// stripped to nil at parse.
-struct TMDBDetails: Sendable {
+struct TMDBDetails: Sendable, Codable {
     let overview: String?
     let genres: String?
     let castTop: String?
@@ -1307,26 +1706,54 @@ struct TMDBDetails: Sendable {
     var backdropPath: String? = nil
     /// Minutes (movie runtime, or the first episode_run_time for tv).
     var runtimeMinutes: Int? = nil
+    /// IMDb id ("tt…"): movie `imdb_id`, or tv `external_ids.imdb_id`.
+    /// Keys the OMDb ratings lookup.
+    var imdbID: String? = nil
+    /// Age rating for `certificationRegion` ("15", "PG-13", "TV-MA"),
+    /// falling back to the US rating when that country has none.
+    var certification: String? = nil
+    /// The device region the certification was picked for; a saved record
+    /// for another region is fetched again.
+    var certificationRegion: String? = nil
+    /// TMDB title logo (transparent PNG) in the device language, English
+    /// or language-neutral; nil when TMDB has none.
+    var logoPath: String? = nil
+    /// Bumped when the fields fetched change; an older saved record is
+    /// fetched again.
+    var schema: Int? = nil
+    static let currentSchema = 2
+
+    /// The Apple TV's region (Settings > General > Region), "US" if unset.
+    static var deviceRegion: String {
+        Locale.current.region?.identifier.uppercased() ?? "US"
+    }
+
+    /// Display form: bare numbers read as an age ("15" -> "15+").
+    var certificationLabel: String? {
+        guard let c = certification?.trimmingCharacters(in: .whitespaces), !c.isEmpty,
+              !["NR", "UR", "NOT RATED", "UNRATED"].contains(c.uppercased()) else { return nil }
+        return c.allSatisfy(\.isNumber) ? "\(c)+" : c
+    }
 }
 
 /// One cast or crew member. `id` stays a String even though TMDB sends an
 /// Int, because every consumer round-trips it into the /person/{id} path.
 /// `role` is the character name for cast, "Director"/"Creator" for crew.
-struct TMDBPerson: Identifiable, Sendable {
+struct TMDBPerson: Identifiable, Sendable, Codable {
     let id: String
     let name: String
     let role: String?
     let profilePath: String?
 }
 
-struct TMDBCredits: Sendable {
+struct TMDBCredits: Sendable, Codable {
     let cast: [TMDBPerson]
     let directors: [TMDBPerson]
 }
 
 /// A Known For tile. `posterPath` is required (entries without art are
 /// filtered before display); `isMovie` routes the deep-link.
-struct TMDBKnownForItem: Identifiable, Sendable {
+struct TMDBKnownForItem: Identifiable, Sendable, Codable {
     let id: String
     let title: String
     let posterPath: String
@@ -1383,6 +1810,84 @@ extension TMDBService {
         let episodeRunTime: [Int]?
         let createdBy: [CreatedBy]?
         let credits: CreditsBlock?
+        /// Movies carry `imdb_id` at the top level; tv only through
+        /// `external_ids` (requested via append_to_response).
+        let imdbID: String?
+        let externalIDs: ExternalIDs?
+        /// Movies: per-country release dates with certifications.
+        let releaseDates: ReleaseDates?
+        /// TV: per-country content ratings.
+        let contentRatings: ContentRatings?
+        let images: Images?
+        struct Images: Decodable {
+            let logos: [Logo]?
+            struct Logo: Decodable {
+                let filePath: String?
+                let lang: String?
+                let voteAverage: Double?
+                enum CodingKeys: String, CodingKey {
+                    case filePath = "file_path"
+                    case lang = "iso_639_1"
+                    case voteAverage = "vote_average"
+                }
+            }
+        }
+        /// Best PNG logo: the device language, then English, then none.
+        func logo(language: String) -> String? {
+            let logos = (images?.logos ?? []).filter { ($0.filePath ?? "").lowercased().hasSuffix(".png") }
+            func best(_ match: (String?) -> Bool) -> String? {
+                logos.filter { match($0.lang) }
+                    .max { ($0.voteAverage ?? 0) < ($1.voteAverage ?? 0) }?.filePath
+            }
+            return best { $0 == language } ?? best { $0 == "en" } ?? best { $0 == nil }
+        }
+        struct ReleaseDates: Decodable {
+            let results: [Country]?
+            struct Country: Decodable {
+                let iso: String?
+                let releaseDates: [Release]?
+                enum CodingKeys: String, CodingKey {
+                    case iso = "iso_3166_1"
+                    case releaseDates = "release_dates"
+                }
+            }
+            struct Release: Decodable {
+                let certification: String?
+                let type: Int?
+            }
+        }
+        struct ContentRatings: Decodable {
+            let results: [Rating]?
+            struct Rating: Decodable {
+                let iso: String?
+                let rating: String?
+                enum CodingKeys: String, CodingKey {
+                    case iso = "iso_3166_1"
+                    case rating
+                }
+            }
+        }
+        /// The age rating for `region`, else the US one.
+        func certification(region: String) -> String? {
+            func pick(_ r: String) -> String? {
+                if let countries = releaseDates?.results {
+                    let rows = countries.first { $0.iso?.uppercased() == r }?.releaseDates ?? []
+                    // Theatrical (3) first, then any release that carries one.
+                    let sorted = rows.sorted { ($0.type == 3 ? 0 : 1) < ($1.type == 3 ? 0 : 1) }
+                    if let c = sorted.compactMap({ $0.certification?.trimmingCharacters(in: .whitespaces) })
+                        .first(where: { !$0.isEmpty }) { return c }
+                }
+                if let ratings = contentRatings?.results,
+                   let c = ratings.first(where: { $0.iso?.uppercased() == r })?.rating?
+                    .trimmingCharacters(in: .whitespaces), !c.isEmpty { return c }
+                return nil
+            }
+            return pick(region) ?? (region == "US" ? nil : pick("US"))
+        }
+        struct ExternalIDs: Decodable {
+            let imdbID: String?
+            enum CodingKeys: String, CodingKey { case imdbID = "imdb_id" }
+        }
         struct Genre: Decodable { let name: String? }
         struct CreatedBy: Decodable {
             let id: FlexID?
@@ -1427,6 +1932,11 @@ extension TMDBService {
             case runtime
             case episodeRunTime = "episode_run_time"
             case createdBy = "created_by"
+            case imdbID = "imdb_id"
+            case externalIDs = "external_ids"
+            case releaseDates = "release_dates"
+            case contentRatings = "content_ratings"
+            case images
         }
     }
 
@@ -1545,10 +2055,17 @@ extension TMDBService {
     /// "" is a confirmed miss. Failed requests are never cached.
     static func resolveID(forTitle title: String, isMovie: Bool, apiKey: String) async -> String? {
         let kind = isMovie ? "movie" : "tv"
-        let cacheKey = "details-id:\(kind):\(title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cacheKey = "details-id:\(kind):\(normalizedTitle)"
         if let cached = cache.object(forKey: cacheKey as NSString) {
             let s = cached as String
             return s.isEmpty ? nil : s
+        }
+        // Saved match: kept until refreshed; a saved "no match" for 30 days.
+        if let saved = MetadataDiskCache.load(String.self, group: "resolve-\(kind)", name: normalizedTitle),
+           saved.value != nil || Date().timeIntervalSince(saved.at) < MetadataDiskCache.retryAfter {
+            cache.setObject((saved.value ?? "") as NSString, forKey: cacheKey as NSString)
+            return saved.value
         }
         let (cleaned, year) = splitTitleYear(title)
         guard !cleaned.isEmpty else { return nil }
@@ -1574,12 +2091,14 @@ extension TMDBService {
             sawConfirmedMiss = true
             if let id = decoded.results?.first?.id?.value, !id.isEmpty {
                 cache.setObject(id as NSString, forKey: cacheKey as NSString)
+                MetadataDiskCache.save(id, group: "resolve-\(kind)", name: normalizedTitle)
                 debugLog("🎬 TMDB resolve '\(title)' (\(kind)) -> id \(id)")
                 return id
             }
         }
         if sawConfirmedMiss {
             cache.setObject("" as NSString, forKey: cacheKey as NSString)
+            MetadataDiskCache.save(String?.none, group: "resolve-\(kind)", name: normalizedTitle)
             debugLog("🎬 TMDB resolve '\(title)' (\(kind)) -> no match")
         }
         return nil
@@ -1596,8 +2115,20 @@ extension TMDBService {
         let kind = isMovie ? "movie" : "tv"
         let cacheKey = "details:\(kind):\(trimmed)" as NSString
         if let boxed = detailsCache.object(forKey: cacheKey) { return boxed.value }
+        let group = MetadataDiskCache.tmdbGroup(kind: kind, id: trimmed)
+        let region = TMDBDetails.deviceRegion
+        // A saved record made for another region (or before age ratings
+        // were fetched) is fetched again so the rating matches this device.
+        if let saved = MetadataDiskCache.load(TMDBDetails.self, group: group, name: "details")?.value,
+           saved.certificationRegion == region, saved.schema == TMDBDetails.currentSchema {
+            detailsCache.setObject(Box(saved), forKey: cacheKey)
+            return saved
+        }
+        let extras = (isMovie ? "credits,external_ids,release_dates" : "credits,external_ids,content_ratings") + ",images"
+        let language = Locale.current.language.languageCode?.identifier ?? "en"
         guard let req = makeRequest(path: "/\(kind)/\(trimmed)",
-                                    queryItems: [URLQueryItem(name: "append_to_response", value: "credits")],
+                                    queryItems: [URLQueryItem(name: "append_to_response", value: extras),
+                                                 URLQueryItem(name: "include_image_language", value: "\(language),en,null")],
                                     key: apiKey) else { return nil }
         guard let (data, resp) = try? await session.data(for: req),
               let http = resp as? HTTPURLResponse, http.statusCode == 200,
@@ -1631,9 +2162,15 @@ extension TMDBService {
             voteAverage: vote,
             posterPath: nonBlank(decoded.posterPath),
             backdropPath: nonBlank(decoded.backdropPath),
-            runtimeMinutes: (decoded.runtime ?? decoded.episodeRunTime?.first).flatMap { $0 > 0 ? $0 : nil }
+            runtimeMinutes: (decoded.runtime ?? decoded.episodeRunTime?.first).flatMap { $0 > 0 ? $0 : nil },
+            imdbID: nonBlank(decoded.imdbID ?? decoded.externalIDs?.imdbID),
+            certification: decoded.certification(region: region),
+            certificationRegion: region,
+            logoPath: nonBlank(decoded.logo(language: language)),
+            schema: TMDBDetails.currentSchema
         )
         detailsCache.setObject(Box(details), forKey: cacheKey)
+        MetadataDiskCache.save(details, group: group, name: "details")
         debugLog("🎬 TMDB details id \(trimmed) (\(kind)) -> ok")
         return details
     }
@@ -1660,6 +2197,11 @@ extension TMDBService {
         let kind = isMovie ? "movie" : "tv"
         let cacheKey = "credits:\(kind):\(trimmed)" as NSString
         if let boxed = creditsCache.object(forKey: cacheKey) { return boxed.value }
+        let group = MetadataDiskCache.tmdbGroup(kind: kind, id: trimmed)
+        if let saved = MetadataDiskCache.load(TMDBCredits.self, group: group, name: "credits")?.value {
+            creditsCache.setObject(Box(saved), forKey: cacheKey)
+            return saved
+        }
         guard let req = makeRequest(path: "/\(kind)/\(trimmed)",
                                     queryItems: [URLQueryItem(name: "append_to_response", value: "credits")],
                                     key: apiKey) else { return nil }
@@ -1683,6 +2225,7 @@ extension TMDBService {
         }
         let credits = TMDBCredits(cast: Array(cast), directors: directors)
         creditsCache.setObject(Box(credits), forKey: cacheKey)
+        MetadataDiskCache.save(credits, group: group, name: "credits")
         debugLog("🎬 TMDB credits id \(trimmed) (\(kind)) -> cast \(credits.cast.count), directors \(credits.directors.count)")
         return credits
     }
@@ -1776,7 +2319,7 @@ extension TMDBService {
 
     // MARK: Season episodes (series page: titles, stills, per-episode cast)
 
-    struct EpisodeInfo: Sendable {
+    struct EpisodeInfo: Sendable, Codable {
         let episodeNumber: Int
         let name: String?
         let overview: String?
@@ -1821,6 +2364,11 @@ extension TMDBService {
     static func seasonEpisodes(tvID: String, season: Int, apiKey: String) async -> [EpisodeInfo] {
         let key = "season:\(tvID):\(season)" as NSString
         if let boxed = seasonCache.object(forKey: key) { return boxed.value }
+        let group = MetadataDiskCache.tmdbGroup(kind: "tv", id: tvID)
+        if let saved = MetadataDiskCache.load([EpisodeInfo].self, group: group, name: "season-\(season)")?.value {
+            seasonCache.setObject(Box(saved), forKey: key)
+            return saved
+        }
         guard let req = makeRequest(path: "/tv/\(tvID)/season/\(season)", key: apiKey) else { return [] }
         guard let (data, resp) = try? await session.data(for: req),
               let http = resp as? HTTPURLResponse, http.statusCode == 200,
@@ -1842,6 +2390,7 @@ extension TMDBService {
                                stillPath: nonBlank(e.stillPath), guestStars: Array(guests.prefix(12)), crew: crew)
         }
         seasonCache.setObject(Box(out), forKey: key)
+        MetadataDiskCache.save(out, group: group, name: "season-\(season)")
         return out
     }
 
@@ -1871,6 +2420,12 @@ extension TMDBService {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         let kind = isMovie ? "movie" : "tv"
+        let group = MetadataDiskCache.tmdbGroup(kind: kind, id: trimmed)
+        if let saved = MetadataDiskCache.load([TMDBKnownForItem].self, group: group, name: "related"),
+           saved.value != nil || Date().timeIntervalSince(saved.at) < MetadataDiskCache.retryAfter {
+            return saved.value ?? []
+        }
+        var answered = false
         for endpoint in ["recommendations", "similar"] {
             var items: [TMDBKnownForItem] = []
             var seen = Set<String>()
@@ -1882,6 +2437,7 @@ extension TMDBService {
                       let http = resp as? HTTPURLResponse, http.statusCode == 200,
                       let decoded = try? JSONDecoder().decode(RecommendationsResponse.self, from: data)
                 else { break }
+                answered = true
                 let rows = decoded.results ?? []
                 for e in rows {
                     guard let rid = e.id?.value, !rid.isEmpty, seen.insert(rid).inserted,
@@ -1894,10 +2450,131 @@ extension TMDBService {
             }
             if !items.isEmpty {
                 debugLog("🎬 TMDB \(endpoint) id \(trimmed) (\(kind)) -> \(items.count)")
+                MetadataDiskCache.save(items, group: group, name: "related")
                 return items
             }
         }
+        // TMDB answered with nothing: remember that for 30 days.
+        if answered { MetadataDiskCache.save([TMDBKnownForItem]?.none, group: group, name: "related") }
         return []
+    }
+
+    // MARK: Trending (the "All Movies" row's top titles)
+
+    /// TMDB's trending titles this week (3 pages, up to 60), saved for a
+    /// day so the home screen asks TMDB at most once a day.
+    static func trending(isMovie: Bool, apiKey: String) async -> [TMDBKnownForItem] {
+        let kind = isMovie ? "movie" : "tv"
+        if let saved = MetadataDiskCache.load([TMDBKnownForItem].self, group: "trending", name: kind),
+           let items = saved.value, Date().timeIntervalSince(saved.at) < 86_400 {
+            return items
+        }
+        var items: [TMDBKnownForItem] = []
+        var seen = Set<String>()
+        for page in 1...3 {
+            guard let req = makeRequest(path: "/trending/\(kind)/week",
+                                        queryItems: [URLQueryItem(name: "page", value: String(page))],
+                                        key: apiKey),
+                  let (data, resp) = try? await session.data(for: req),
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let decoded = try? JSONDecoder().decode(RecommendationsResponse.self, from: data)
+            else { break }
+            for e in decoded.results ?? [] {
+                guard let id = e.id?.value, seen.insert(id).inserted,
+                      let title = nonBlank(e.title ?? e.name),
+                      let poster = nonBlank(e.posterPath) else { continue }
+                items.append(TMDBKnownForItem(id: id, title: title, posterPath: poster, isMovie: isMovie))
+            }
+        }
+        if !items.isEmpty { MetadataDiskCache.save(items, group: "trending", name: kind) }
+        debugLog("🎬 TMDB trending \(kind): \(items.count)")
+        return items
+    }
+
+    // MARK: Refresh + Fix Match
+
+    /// Drop everything saved for one title (Refresh Info / Fix Match):
+    /// the TMDB title's details, cast, related and episode files, and the
+    /// title-search matches that led to it, from memory and disk.
+    static func forgetTitle(tmdbIDs: [String], titles: [String], isMovie: Bool) {
+        let kind = isMovie ? "movie" : "tv"
+        for raw in tmdbIDs {
+            let id = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { continue }
+            detailsCache.removeObject(forKey: "details:\(kind):\(id)" as NSString)
+            creditsCache.removeObject(forKey: "credits:\(kind):\(id)" as NSString)
+            MetadataDiskCache.removeGroup(MetadataDiskCache.tmdbGroup(kind: kind, id: id))
+        }
+        seasonCache.removeAllObjects()
+        for t in titles {
+            let normalized = t.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty else { continue }
+            cache.removeObject(forKey: "details-id:\(kind):\(normalized)" as NSString)
+            MetadataDiskCache.remove(group: "resolve-\(kind)", name: normalized)
+        }
+    }
+
+    private struct CandidateRow: Decodable {
+        let id: FlexID?
+        let title: String?
+        let name: String?
+        let releaseDate: String?
+        let firstAirDate: String?
+        let posterPath: String?
+        let overview: String?
+        enum CodingKeys: String, CodingKey {
+            case id, title, name, overview
+            case releaseDate = "release_date"
+            case firstAirDate = "first_air_date"
+            case posterPath = "poster_path"
+        }
+        var candidate: TMDBMatchCandidate? {
+            guard let id = id?.value, !id.isEmpty,
+                  let t = TMDBService.nonBlank(title ?? name) else { return nil }
+            let date = TMDBService.nonBlank(releaseDate ?? firstAirDate) ?? ""
+            return TMDBMatchCandidate(id: id, title: t, year: String(date.prefix(4)),
+                                      posterPath: TMDBService.nonBlank(posterPath),
+                                      overview: TMDBService.nonBlank(overview) ?? "")
+        }
+    }
+    private struct CandidateSearch: Decodable { let results: [CandidateRow]? }
+    private struct CandidateFind: Decodable {
+        let movieResults: [CandidateRow]?
+        let tvResults: [CandidateRow]?
+        enum CodingKeys: String, CodingKey {
+            case movieResults = "movie_results"
+            case tvResults = "tv_results"
+        }
+    }
+
+    /// Fix Match results. The query may be a title ("Dune 2021" narrows by
+    /// year), a TMDB id ("438631") or an IMDb id ("tt1160419"). Never
+    /// cached: the user is looking for something the saved data got wrong.
+    static func matchCandidates(query: String, isMovie: Bool, apiKey: String) async -> [TMDBMatchCandidate] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return [] }
+        let kind = isMovie ? "movie" : "tv"
+        func get<T: Decodable>(_ path: String, _ items: [URLQueryItem], as: T.Type) async -> T? {
+            guard let req = makeRequest(path: path, queryItems: items, key: apiKey),
+                  let (data, resp) = try? await session.data(for: req),
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            return try? JSONDecoder().decode(T.self, from: data)
+        }
+        if q.lowercased().hasPrefix("tt"), q.dropFirst(2).allSatisfy(\.isNumber) {
+            let found = await get("/find/\(q.lowercased())",
+                                  [URLQueryItem(name: "external_source", value: "imdb_id")], as: CandidateFind.self)
+            return ((isMovie ? found?.movieResults : found?.tvResults) ?? []).compactMap(\.candidate)
+        }
+        if q.allSatisfy(\.isNumber) {
+            let row = await get("/\(kind)/\(q)", [], as: CandidateRow.self)
+            return row?.candidate.map { [$0] } ?? []
+        }
+        let (cleaned, year) = splitTitleYear(q)
+        var items = [URLQueryItem(name: "query", value: cleaned.isEmpty ? q : cleaned),
+                     URLQueryItem(name: "include_adult", value: "false")]
+        if let y = year { items.append(URLQueryItem(name: isMovie ? "year" : "first_air_date_year", value: y)) }
+        let found = await get("/search/\(kind)", items, as: CandidateSearch.self)
+        return Array((found?.results ?? []).compactMap(\.candidate).prefix(20))
     }
 
     // MARK: Person bio + Known For
@@ -2338,6 +3015,17 @@ final class TMDBArtCache: ObservableObject {
         }
         if prune(to: Self.maxEntries) { dirty = true }
         if dirty { scheduleSave() }
+        // Genres learned in earlier launches: make sure the catalog has them.
+        let rows: [(kind: VODItemType, cleanTitle: String, genres: String)] = entries.compactMap { key, e in
+            guard key.count > 2, let g = CinemaGenres.normalize(e.genres) else { return nil }
+            return (key.hasPrefix("t:") ? .series : .movie, String(key.dropFirst(2)).lowercased(), g)
+        }
+        if !rows.isEmpty {
+            Task { @MainActor in
+                await VODCatalogStore.shared.setTMDBGenres(rows)
+                genreRevision &+= 1
+            }
+        }
     }
 
     /// Keeps at most `limit` entries: confirmed misses (empty poster) go
@@ -2397,6 +3085,57 @@ final class TMDBArtCache: ObservableObject {
         return e.tmdbID
     }
 
+    /// Clean titles (lowercased, as the catalog stores them) of the library
+    /// titles matched to these TMDB ids, for the trending row.
+    func cleanTitles(forTMDBIDs ids: [String], isMovie: Bool) -> [String: String] {
+        loadIfNeeded()
+        let wanted = Set(ids)
+        let prefix = isMovie ? "m:" : "t:"
+        var out: [String: String] = [:]
+        for (key, e) in entries where key.hasPrefix(prefix) && wanted.contains(e.tmdbID) {
+            if out[e.tmdbID] == nil { out[e.tmdbID] = String(key.dropFirst(2)).lowercased() }
+        }
+        return out
+    }
+
+    /// Fix Match: the grid's art and card metadata now come from the TMDB
+    /// title the user picked. Enrichment never touches an entry that has
+    /// art, so this sticks.
+    func pin(_ item: VODDisplayItem, tmdbID: String, details: TMDBDetails?) {
+        loadIfNeeded()
+        let e = Entry(tmdbID: tmdbID, poster: details?.posterPath ?? "", backdrop: details?.backdropPath ?? "",
+                      at: Date(), overview: details?.overview,
+                      year: details?.year ?? "", rating: details?.voteAverage ?? "", genres: details?.genres ?? "")
+        store(e, key: Self.key(for: item))
+        bumpVersion()
+    }
+
+    /// Refresh Info / Reset Match: look the title up again by its name and
+    /// replace the grid art. Keeps the old entry if TMDB cannot be reached.
+    func refresh(_ item: VODDisplayItem) async {
+        guard TMDBPosters.isEnabled, let apiKey = TMDBPosters.apiKey else { return }
+        loadIfNeeded()
+        let key = Self.key(for: item)
+        guard let e = await TMDBService.lookupArt(title: item.tmdbSearchTitle,
+                                                  isMovie: item.type == .movie, apiKey: apiKey) else { return }
+        store(e, key: key)
+        bumpVersion()
+    }
+
+    /// Clear Saved Info: forget every saved poster match so the library
+    /// re-resolves art on the next sweep.
+    func removeAll() {
+        loadIfNeeded()
+        entries.removeAll()
+        overviews.removeAll()
+        overviewOrder.removeAll()
+        dirty = true
+        scheduleSave()
+        bumpVersion()
+    }
+
+    private func bumpVersion() { version &+= 1 }
+
     private func rememberOverview(_ text: String?, key: String) {
         guard let text, !text.isEmpty else { return }
         if overviews.updateValue(text, forKey: key) != nil {
@@ -2408,7 +3147,30 @@ final class TMDBArtCache: ObservableObject {
         }
     }
 
+    /// Bumped after TMDB genres reach the catalog (genre tiles re-query).
+    @Published private(set) var genreRevision = 0
+    private var pendingGenres: [(kind: VODItemType, cleanTitle: String, genres: String)] = []
+    private var genreFlushTask: Task<Void, Never>?
+
+    /// Hand a title's TMDB genres to the catalog, batched every few seconds,
+    /// so genre tiles can find movies the provider gave no genre.
+    private func queueGenres(key: String, genres: String) {
+        guard key.count > 2, let normalized = CinemaGenres.normalize(genres) else { return }
+        let kind: VODItemType = key.hasPrefix("t:") ? .series : .movie
+        pendingGenres.append((kind, String(key.dropFirst(2)).lowercased(), normalized))
+        guard genreFlushTask == nil else { return }
+        genreFlushTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            let rows = pendingGenres
+            pendingGenres = []
+            genreFlushTask = nil
+            await VODCatalogStore.shared.setTMDBGenres(rows)
+            genreRevision &+= 1
+        }
+    }
+
     private func store(_ e: Entry, key: String) {
+        queueGenres(key: key, genres: e.genres)
         rememberOverview(e.overview, key: key)
         var slim = e
         slim.overview = nil

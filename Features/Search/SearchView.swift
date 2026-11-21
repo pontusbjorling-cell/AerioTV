@@ -272,6 +272,12 @@ struct SearchView: View {
             }
             // Clears the persistent nav chrome band the caller leaves visible.
             .padding(.top, 24)
+            #if os(tvOS)
+            // Opening Search lands straight in text entry (keyboard up).
+            .onAppear {
+                if query.isEmpty { TVKeyboard.open(placeholderPrefix: "Search movies, shows") }
+            }
+            #endif
         }
         .onChange(of: query) { _, newValue in
             scheduleSearch(newValue)
