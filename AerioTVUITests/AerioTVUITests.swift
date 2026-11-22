@@ -327,4 +327,242 @@ final class AerioTVUITests: XCTestCase {
         app.terminate()
     }
 
+
+    /// Cinema home focus walk: open Movies, step Down through the rows and
+    /// back Up, saving a screenshot after every press to the runner's tmp
+    /// folder (cinema-NN-<step>.png) so the scroll behaviour can be checked.
+    func testCinemaHomeFocusWalk() throws { try cinemaWalk(rights: 1, prefix: "cinema") }
+
+    /// Same walk on the TV Shows tab (genre tiles come from provider genres).
+    func testCinemaTVShowsFocusWalk() throws { try cinemaWalk(rights: 2, prefix: "cinema-tv") }
+
+    private func cinemaWalk(rights: Int, prefix: String) throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        var n = 0
+        func shot(_ label: String) {
+            n += 1
+            let url = dir.appendingPathComponent(String(format: "%@-%02d-%@.png", prefix, n, label))
+            try? XCUIScreen.main.screenshot().pngRepresentation.write(to: url)
+        }
+        for _ in 0..<rights { remote.press(.right); pause(1.5) }
+        pause(2); shot("tab")
+        for i in 1...4 { remote.press(.down); pause(2.5); shot("down\(i)") }
+        for i in 1...6 { remote.press(.up); pause(2.0); shot("up\(i)") }
+        NSLog("AERIO-UITEST: cinema shots in %@", dir.path)
+    }
+
+    /// See all on the first category row opens the full list; Menu must
+    /// bring back the home rows (not strand the user in the list).
+    func testCinemaCategoryMenuBack() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        func shot(_ label: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation
+                .write(to: dir.appendingPathComponent("cat-\(label).png"))
+        }
+        remote.press(.right); pause(2)
+        // Genre tile -> its list -> Menu back to the home rows.
+        remote.press(.down); pause(2); shot("1-genre-focused")
+        remote.press(.select); pause(3); shot("2-genre-open")
+        remote.press(.menu); pause(3); shot("3-genre-back")
+        // First category row -> See all -> Menu back.
+        remote.press(.down); pause(2)
+        for _ in 0..<17 { remote.press(.right); pause(0.4) }
+        pause(1); shot("4-seeall-focused")
+        remote.press(.select); pause(3); shot("5-category-open")
+        remote.press(.menu); pause(3); shot("6-category-back")
+    }
+
+    /// The global Search circle opens Search with the keyboard already up.
+    func testSearchOpensKeyboard() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        remote.press(.left); pause(1)
+        try? XCUIScreen.main.screenshot().pngRepresentation
+            .write(to: dir.appendingPathComponent("search-0-circle.png"))
+        remote.press(.select); pause(3)
+        try? XCUIScreen.main.screenshot().pngRepresentation
+            .write(to: dir.appendingPathComponent("search-1-opened.png"))
+        NSLog("AERIO-UITEST: keyboards=%d", app.keyboards.count)
+    }
+
+    /// Dump the Movies home element tree (frames, focus) after one Down.
+    func testCinemaDumpTree() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        remote.press(.right); pause(2)
+        remote.press(.down); pause(2)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cinema_tree.txt")
+        try app.debugDescription.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Genre tile Select after the page has settled.
+    func testCinemaGenreSelectSettled() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        remote.press(.right); pause(6)
+        remote.press(.down); pause(2)
+        remote.press(.select); pause(3)
+        try? XCUIScreen.main.screenshot().pngRepresentation
+            .write(to: dir.appendingPathComponent("genre-settled-open.png"))
+    }
+
+    /// Heading Select opens the category; the All row sits at the bottom.
+    func testCinemaHeadingsAndAllRow() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        func shot(_ label: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation
+                .write(to: dir.appendingPathComponent("head-\(label).png"))
+        }
+        remote.press(.right); pause(6)
+        remote.press(.left); pause(0.5); remote.press(.right); pause(1)
+        remote.press(.down); pause(1.5)       // genres
+        for _ in 0..<6 { remote.press(.left); pause(0.3) }   // first tile
+        remote.press(.down); pause(1.5); shot("1-heading-focused")
+        remote.press(.select); pause(3); shot("2-heading-open")
+        remote.press(.menu); pause(3); shot("3-back")
+        for _ in 0..<90 { remote.press(.down); pause(0.25) }
+        pause(2); shot("4-bottom")
+        remote.press(.up); pause(1.5); shot("5-all-heading")
+    }
+
+    /// Open the first poster of the first category and capture the detail page.
+    func testCinemaDetailAgeRating() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        remote.press(.right); pause(6)
+        remote.press(.down); pause(1.5)
+        for _ in 0..<6 { remote.press(.left); pause(0.3) }
+        remote.press(.down); pause(1)      // heading
+        remote.press(.down); pause(1)      // first poster
+        remote.press(.right); pause(1)     // second poster
+        remote.press(.select); pause(8)
+        try? XCUIScreen.main.screenshot().pngRepresentation
+            .write(to: FileManager.default.temporaryDirectory.appendingPathComponent("detail-age.png"))
+    }
+
+    /// Movie detail -> first Cast & Crew person -> bio: Known For must only
+    /// list titles that are in the library.
+    func testCinemaKnownForLibraryOnly() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        func shot(_ label: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation
+                .write(to: dir.appendingPathComponent("kf-\(label).png"))
+        }
+        remote.press(.right); pause(6)
+        remote.press(.down); pause(1.5)   // genre tile
+        remote.press(.down); pause(1.5)   // first category poster
+        remote.press(.select); pause(8); shot("1-detail")
+        remote.press(.down); pause(1.5); shot("2-cast")
+        remote.press(.select); pause(7); shot("3-bio")
+        remote.press(.down); pause(1.5); shot("4-bio-down")
+        remote.press(.down); pause(1.5); shot("5-bio-down2")
+    }
+
+    /// Detail page walk: open the first category poster, then step down.
+    func testCinemaDetailWalk() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        func shot(_ label: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation
+                .write(to: dir.appendingPathComponent("dw-\(label).png"))
+        }
+        remote.press(.right); pause(6)
+        remote.press(.down); pause(1.5)
+        remote.press(.down); pause(1.5)
+        remote.press(.right); pause(1)
+        remote.press(.select); pause(9); shot("0-top")
+        for i in 1...5 { remote.press(.down); pause(1.8); shot("\(i)-down") }
+    }
+
+    /// TV show detail: hero, then the seasons section.
+    func testCinemaSeriesDetailWalk() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        func shot(_ label: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation
+                .write(to: dir.appendingPathComponent("sw-\(label).png"))
+        }
+        remote.press(.right); pause(1.5); remote.press(.right); pause(6)
+        remote.press(.down); pause(1.5)
+        remote.press(.down); pause(1.5)
+        remote.press(.select); pause(9); shot("0-top")
+        for i in 1...2 { remote.press(.down); pause(1.8); shot("\(i)-down") }
+    }
+
+    /// TV show: buttons, then hold Select on episode 3 -> Mark Up to Here.
+    func testCinemaEpisodeMarkUpTo() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        func shot(_ label: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation
+                .write(to: dir.appendingPathComponent("ep-\(label).png"))
+        }
+        remote.press(.right); pause(1.5); remote.press(.right); pause(6)
+        remote.press(.down); pause(1.5)
+        remote.press(.down); pause(1.5)
+        remote.press(.select); pause(9); shot("0-top")
+        for i in 1...2 { remote.press(.down); pause(1.5); shot("1-down\(i)") }
+        remote.press(.right); pause(1); remote.press(.right); pause(1.5); shot("2-ep3")
+        remote.press(.select, forDuration: 1.6); pause(2); shot("3-menu")
+        remote.press(.down); pause(1); shot("4-menu-down")
+        remote.press(.select); pause(2.5); shot("5-after")
+    }
+
+    /// Undo testCinemaEpisodeMarkUpTo's changes on the same show: remove
+    /// it from Favorites and reset its watched state (mark all, then reset).
+    func testCinemaCleanupFoolMeOnce() throws {
+        let app = XCUIApplication()
+        app.launch()
+        pause(10)
+        let remote = XCUIRemote.shared
+        let dir = FileManager.default.temporaryDirectory
+        func shot(_ label: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation
+                .write(to: dir.appendingPathComponent("clean-\(label).png"))
+        }
+        remote.press(.right); pause(1.5); remote.press(.right); pause(6)
+        remote.press(.down); pause(1.5)
+        remote.press(.down); pause(1.5)
+        remote.press(.select); pause(9); shot("0-open")
+        remote.press(.right); pause(1); shot("1-heart")
+        remote.press(.select); pause(1.5); shot("2-unhearted")
+        remote.press(.down); pause(1); shot("3-watched-btn")
+        remote.press(.select); pause(2); shot("4-all-watched")
+        remote.press(.select); pause(2); shot("5-reset")
+    }
 }
